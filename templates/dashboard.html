@@ -1,0 +1,90 @@
+﻿<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Paper Trading Dashboard v7.0</title>
+<link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+<nav class="navbar">
+  <div class="nav-brand">PaperTrader v7.0</div>
+  <div class="nav-links">
+    <a href="/dashboard" class="active">Dashboard</a>
+    <a href="/analysis">Analysis</a>
+    <a href="/backtesting">Backtesting</a>
+    <a href="/options">Options</a>
+  </div>
+  <div id="market-status" class="market-badge">--</div>
+</nav>
+
+<main class="container">
+  <div class="grid-4">
+    <div class="card stat-card">
+      <div class="stat-label">Capital</div>
+      <div class="stat-value" id="capital">Rs.--</div>
+      <div class="stat-sub" id="roi">ROI: --%</div>
+    </div>
+    <div class="card stat-card">
+      <div class="stat-label">Today P&L</div>
+      <div class="stat-value" id="daily-pnl">Rs.--</div>
+      <div class="stat-sub" id="trades-today">Trades: --</div>
+    </div>
+    <div class="card stat-card">
+      <div class="stat-label">Total P&L</div>
+      <div class="stat-value" id="total-pnl">Rs.--</div>
+      <div class="stat-sub" id="win-rate">Win: --%</div>
+    </div>
+    <div class="card stat-card">
+      <div class="stat-label">Open Positions</div>
+      <div class="stat-value" id="open-positions">--</div>
+      <div class="stat-sub" id="heat">Heat: --%</div>
+    </div>
+  </div>
+
+  <div class="card" id="risk-panel">
+    <div class="card-header">
+      <h2>Risk Status</h2>
+      <span id="trading-status" class="badge badge-green">ACTIVE</span>
+    </div>
+    <div class="grid-3">
+      <div class="metric">
+        <span class="metric-label">Drawdown</span>
+        <span class="metric-value" id="drawdown">--%</span>
+      </div>
+      <div class="metric">
+        <span class="metric-label">Consecutive Losses</span>
+        <span class="metric-value" id="consec-losses">--</span>
+      </div>
+      <div class="metric">
+        <span class="metric-label">Size Multiplier</span>
+        <span class="metric-value" id="size-mult">--x</span>
+      </div>
+    </div>
+    <div id="circuit-breaker-msg" class="alert alert-danger" style="display:none"></div>
+  </div>
+
+  <div class="card">
+    <div class="card-header">
+      <h2>Open Positions</h2>
+      <button onclick="loadDashboard()" class="btn btn-sm">Refresh</button>
+    </div>
+    <div id="positions-container">
+      <div class="empty-state">Loading positions...</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-header">
+      <h2>Recent Trades</h2>
+    </div>
+    <div id="trades-container">
+      <div class="empty-state">Loading trades...</div>
+    </div>
+  </div>
+</main>
+
+<script src="/static/js/utils.js"></script>
+<script src="/static/js/dashboard.js"></script>
+</body>
+</html>

@@ -1,0 +1,70 @@
+﻿<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Market Analysis - PaperTrader v7.0</title>
+<link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+<nav class="navbar">
+  <div class="nav-brand">PaperTrader v7.0</div>
+  <div class="nav-links">
+    <a href="/dashboard">Dashboard</a>
+    <a href="/analysis" class="active">Analysis</a>
+    <a href="/backtesting">Backtesting</a>
+    <a href="/options">Options</a>
+  </div>
+  <div id="market-status" class="market-badge">--</div>
+</nav>
+
+<main class="container">
+  <div class="card">
+    <div class="card-header">
+      <h2>Signal Analysis</h2>
+      <div class="flex-row gap-8">
+        <select id="symbol-select" class="input-sm">
+          <option value="NIFTY">NIFTY</option>
+          <option value="BANKNIFTY">BANKNIFTY</option>
+        </select>
+        <button onclick="runAnalysis()" class="btn">Analyse</button>
+      </div>
+    </div>
+    <div id="analysis-result">
+      <div class="empty-state">Select a symbol and click Analyse</div>
+    </div>
+  </div>
+
+  <div class="card" id="confluence-card" style="display:none">
+    <div class="card-header"><h2>Confluence Breakdown</h2></div>
+    <div id="confluence-factors"></div>
+  </div>
+
+  <div class="card" id="levels-card" style="display:none">
+    <div class="card-header"><h2>Price Levels</h2></div>
+    <div class="grid-3">
+      <div class="metric">
+        <span class="metric-label">Entry</span>
+        <span class="metric-value" id="level-entry">--</span>
+      </div>
+      <div class="metric">
+        <span class="metric-label">Stop Loss</span>
+        <span class="metric-value red" id="level-sl">--</span>
+      </div>
+      <div class="metric">
+        <span class="metric-label">Take Profit</span>
+        <span class="metric-value green" id="level-tp">--</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-header"><h2>Market Status</h2></div>
+    <div id="market-detail">Loading...</div>
+  </div>
+</main>
+
+<script src="/static/js/utils.js"></script>
+<script src="/static/js/analysis.js"></script>
+</body>
+</html>

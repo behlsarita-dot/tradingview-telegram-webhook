@@ -1,0 +1,107 @@
+﻿<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Backtesting - PaperTrader v7.0</title>
+<link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+<nav class="navbar">
+  <div class="nav-brand">PaperTrader v7.0</div>
+  <div class="nav-links">
+    <a href="/dashboard">Dashboard</a>
+    <a href="/analysis">Analysis</a>
+    <a href="/backtesting" class="active">Backtesting</a>
+    <a href="/options">Options</a>
+  </div>
+  <div id="market-status" class="market-badge">--</div>
+</nav>
+
+<main class="container">
+  <div class="card">
+    <div class="card-header"><h2>Backtest Parameters</h2></div>
+    <div class="form-grid">
+      <div class="form-group">
+        <label>Symbol</label>
+        <select id="bt-symbol" class="input">
+          <option value="NIFTY">NIFTY</option>
+          <option value="BANKNIFTY">BANKNIFTY</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label>Timeframe</label>
+        <select id="bt-timeframe" class="input">
+          <option value="15m">15 min</option>
+          <option value="1h">1 Hour</option>
+          <option value="1d">Daily</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label>Start Date</label>
+        <input type="date" id="bt-start" class="input" value="2025-01-01">
+      </div>
+      <div class="form-group">
+        <label>End Date</label>
+        <input type="date" id="bt-end" class="input" value="2025-12-31">
+      </div>
+      <div class="form-group">
+        <label>ADX Threshold</label>
+        <input type="number" id="bt-adx" class="input" value="25" min="15" max="40">
+      </div>
+      <div class="form-group">
+        <label>Min Confluence</label>
+        <input type="number" id="bt-confluence" class="input" value="3" min="1" max="5">
+      </div>
+      <div class="form-group">
+        <label>SL %</label>
+        <input type="number" id="bt-sl" class="input" value="1.0" step="0.1">
+      </div>
+      <div class="form-group">
+        <label>TP %</label>
+        <input type="number" id="bt-tp" class="input" value="2.0" step="0.1">
+      </div>
+    </div>
+    <button onclick="runBacktest()" class="btn btn-primary" id="bt-btn">Run Backtest</button>
+  </div>
+
+  <div id="bt-loading" style="display:none" class="card">
+    <div class="empty-state">Running backtest... this may take 30-60 seconds</div>
+  </div>
+
+  <div id="bt-results" style="display:none">
+    <div class="grid-4">
+      <div class="card stat-card">
+        <div class="stat-label">Total Trades</div>
+        <div class="stat-value" id="bt-total">--</div>
+      </div>
+      <div class="card stat-card">
+        <div class="stat-label">Win Rate</div>
+        <div class="stat-value" id="bt-winrate">--%</div>
+      </div>
+      <div class="card stat-card">
+        <div class="stat-label">Total P&L</div>
+        <div class="stat-value" id="bt-pnl">Rs.--</div>
+      </div>
+      <div class="card stat-card">
+        <div class="stat-label">Max Drawdown</div>
+        <div class="stat-value" id="bt-dd">--%</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header"><h2>Detailed Results</h2></div>
+      <div id="bt-detail"></div>
+    </div>
+
+    <div class="card">
+      <div class="card-header"><h2>Trade Log (last 50)</h2></div>
+      <div id="bt-trades"></div>
+    </div>
+  </div>
+</main>
+
+<script src="/static/js/utils.js"></script>
+<script src="/static/js/backtesting.js"></script>
+</body>
+</html>

@@ -1,0 +1,195 @@
+﻿<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Options - PaperTrader v7.0</title>
+<link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+<nav class="navbar">
+  <div class="nav-brand">PaperTrader v7.0</div>
+  <div class="nav-links">
+    <a href="/dashboard">Dashboard</a>
+    <a href="/analysis">Analysis</a>
+    <a href="/backtesting">Backtesting</a>
+    <a href="/options" class="active">Options</a>
+  </div>
+  <div id="market-status" class="market-badge">--</div>
+</nav>
+
+<main class="container">
+  <div class="card">
+    <div class="card-header">
+      <h2>Open Option Positions</h2>
+      <button onclick="loadOptionPositions()" class="btn btn-sm">Refresh</button>
+    </div>
+    <div id="option-positions">
+      <div class="empty-state">Loading...</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-header"><h2>Manual Option Entry</h2></div>
+    <div class="form-grid">
+      <div class="form-group">
+        <label>Underlying</label>
+        <select id="opt-underlying" class="input">
+          <option value="NIFTY">NIFTY</option>
+          <option value="BANKNIFTY">BANKNIFTY</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label>Option Type</label>
+        <select id="opt-type" class="input">
+          <option value="CE">CE (Call)</option>
+          <option value="PE">PE (Put)</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label>Strike</label>
+        <input type="number" id="opt-strike" class="input" placeholder="24000">
+      </div>
+      <div class="form-group">
+        <label>Expiry (e.g. 07JUL2026)</label>
+        <input type="text" id="opt-expiry" class="input" placeholder="07JUL2026">
+      </div>
+      <div class="form-group">
+        <label>Premium (Rs.)</label>
+        <input type="number" id="opt-premium" class="input" step="0.05">
+      </div>
+      <div class="form-group">
+        <label>Quantity (units)</label>
+        <input type="number" id="opt-qty" class="input" value="65">
+      </div>
+      <div class="form-group">
+        <label>Stop Loss (Rs.)</label>
+        <input type="number" id="opt-sl" class="input" step="0.05">
+      </div>
+      <div class="form-group">
+        <label>Take Profit (Rs.)</label>
+        <input type="number" id="opt-tp" class="input" step="0.05">
+      </div>
+    </div>
+    <button onclick="submitOption()" class="btn btn-primary">Open Position</button>
+    <div id="opt-msg" class="mt-8"></div>
+  </div>
+
+  <div class="card">
+    <div class="card-header"><h2>Charge Calculator</h2></div>
+    <div class="form-grid">
+      <div class="form-group">
+        <label>Premium (Rs.)</label>
+        <input type="number" id="calc-premium" class="input" step="0.05" oninput="calcCharges()">
+      </div>
+      <div class="form-group">
+        <label>Quantity</label>
+        <input type="number" id="calc-qty" class="input" value="65" oninput="calcCharges()">
+      </div>
+    </div>
+    <div class="grid-3" id="calc-result" style="display:none">
+      <div class="metric">
+        <span class="metric-label">Buy Charges</span>
+        <span class="metric-value" id="calc-buy">--</span>
+      </div>
+      <div class="metric">
+        <span class="metric-label">Sell Charges</span>
+        <span class="metric-value" id="calc-sell">--</span>
+      </div>
+      <div class="metric">
+        <span class="metric-label">Total Round-trip</span>
+        <span class="metric-value" id="calc-total">--</span>
+      </div>
+    </div>
+  </div>
+</main>
+
+<script src="/static/js/utils.js"></script>
+<script>
+async function loadOptionPositions() {
+  const res = await api("/api/options/positions");
+  const cont = document.getElementById("option-positions");
+  if (!res.success || res.total === 0) {
+    cont.innerHTML = "<div class=\"empty-state\">No open option positions</div>";
+    return;
+  }
+  cont.innerHTML = res.positions.map(p => `
+    <div class="position-row">
+      <div class="pos-symbol">${p.option_symbol}</div>
+      <div class="pos-type">${p.option_type}</div>
+      <div class="pos-detail">Strike Rs.${fmt(p.strike)} | Premium Rs.${fmt(p.premium)}</div>
+      <div class="pos-detail">Qty ${p.quantity} | Expiry ${p.expiry}</div>
+      <div class="pos-time">${p.entry_time ? p.entry_time.slice(0,19) : ""}</div>
+    </div>
+  `).join("");
+}
+
+async function submitOption() {
+  const underlying = document.getElementById("opt-underlying").value;
+  const type = document.getElementById("opt-type").value;
+  const strike = parseFloat(document.getElementById("opt-strike").value);
+  const expiry = document.getElementById("opt-expiry").value;
+  const premium = parseFloat(document.getElementById("opt-premium").value);
+  const qty = parseInt(document.getElementById("opt-qty").value);
+  const sl = parseFloat(document.getElementById("opt-sl").value) || null;
+  const tp = parseFloat(document.getElementById("opt-tp").value) || null;
+
+  const secret = prompt("Enter webhook secret:");
+  if (!secret) return;
+
+  const payload = {
+    webhook_secret: secret,
+    action: "BUY_OPTION",
+    symbol: underlying,
+    option_symbol: `${underlying}${expiry}${type}${strike}`,
+    option_type: type,
+    strike, expiry, premium, quantity: qty, sl, tp
+  };
+
+  const res = await postApi("/api/webhook", payload);
+  const msg = document.getElementById("opt-msg");
+  if (res.success) {
+    msg.innerHTML = "<div class=\"alert alert-success\">Option position opened!</div>";
+    loadOptionPositions();
+  } else {
+    msg.innerHTML = `<div class="alert alert-danger">${res.message}</div>`;
+  }
+}
+
+function calcCharges() {
+  const premium = parseFloat(document.getElementById("calc-premium").value) || 0;
+  const qty = parseInt(document.getElementById("calc-qty").value) || 65;
+  if (premium <= 0) return;
+
+  const turnover = premium * qty;
+  const brokeragePer = 20;
+  const exchangePct = 0.053 / 100;
+  const gstPct = 0.18;
+  const sebiRate = 10 / 1e7;
+  const sttPct = 0.0625 / 100;
+  const stampPct = 0.003 / 100;
+
+  function charges(side) {
+    const b = brokeragePer;
+    const ex = exchangePct * turnover;
+    const g = gstPct * (b + ex);
+    const s = sebiRate * turnover;
+    const stt = side === "SELL" ? sttPct * turnover : 0;
+    const stamp = side === "BUY" ? stampPct * turnover : 0;
+    return b + ex + g + s + stt + stamp;
+  }
+
+  const buy = charges("BUY");
+  const sell = charges("SELL");
+
+  document.getElementById("calc-result").style.display = "grid";
+  document.getElementById("calc-buy").textContent = `Rs.${buy.toFixed(2)}`;
+  document.getElementById("calc-sell").textContent = `Rs.${sell.toFixed(2)}`;
+  document.getElementById("calc-total").textContent = `Rs.${(buy + sell).toFixed(2)}`;
+}
+
+loadOptionPositions();
+loadMarketStatus();
+</script>
+</body>
+</html>

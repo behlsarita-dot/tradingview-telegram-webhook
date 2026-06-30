@@ -1,7 +1,39 @@
-venv
-venv/
-.venv
-.venv/
-__pycache__/
-*.pyc
+# Environment
 .env
+.env.local
+.env.backup
+
+# Database
+*.db
+*.db-shm
+*.db-wal
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+venv/
+
+# Logs
+*.log
+logs/
+
+# Backups & exports
+backups/
+exports/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Config with secrets
+pnl_config.json
