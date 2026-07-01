@@ -1,0 +1,48 @@
+﻿services:
+  - type: web
+    name: tradingview-telegram-webhook
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app -c gunicorn.conf.py
+    healthCheckPath: /health
+    envVars:
+      - key: FLASK_ENV
+        value: production
+      - key: FLASK_DEBUG
+        value: "False"
+      - key: TRADING_MODE
+        value: PAPER
+      - key: INITIAL_CAPITAL
+        value: "500000"
+      - key: LOT_SIZE
+        value: "65"
+      - key: DEFAULT_SYMBOL
+        value: NIFTY
+      - key: ENABLE_RISK_MANAGEMENT
+        value: "true"
+      - key: POSITION_SIZING_METHOD
+        value: fixed_fractional
+      - key: RISK_PER_TRADE_PERCENT
+        value: "1.0"
+      - key: MAX_DRAWDOWN_PCT
+        value: "15.0"
+      - key: MAX_DAILY_LOSS
+        value: "15000"
+      - key: MAX_OPEN_POSITIONS
+        value: "5"
+      - key: TELEGRAM_ENABLED
+        value: "true"
+      - key: LOG_LEVEL
+        value: INFO
+      - key: WEBHOOK_MAX_AGE_SECONDS
+        value: "300"
+      - key: DB_FILE
+        value: /tmp/trading_bot.db
+      - key: SECRET_KEY
+        sync: false
+      - key: WEBHOOK_SECRET
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
