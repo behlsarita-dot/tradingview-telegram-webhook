@@ -1,7 +1,6 @@
 ﻿#!/usr/bin/env python3
 """
 Database Manager - Paper Trading System v7.0
-SQLite with WAL mode, thread-safe cursor context manager.
 """
 
 import sqlite3
@@ -9,7 +8,7 @@ import logging
 import uuid
 from contextlib import contextmanager
 from datetime import datetime
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict
 
 from config import DB_FILE, INITIAL_CAPITAL, TRADING_MODE
 
@@ -23,7 +22,6 @@ class DatabaseManager:
 
     @contextmanager
     def get_cursor(self):
-        """Thread-safe cursor context manager."""
         conn = sqlite3.connect(self.db_file, timeout=30, check_same_thread=False)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA busy_timeout=30000")
@@ -40,7 +38,6 @@ class DatabaseManager:
             conn.close()
 
     def _init_db(self):
-        """Create all tables if they do not exist."""
         with self.get_cursor() as c:
             c.execute("""
                 CREATE TABLE IF NOT EXISTS account (
@@ -54,6 +51,8 @@ class DatabaseManager:
                     total_trades INTEGER NOT NULL DEFAULT 0,
                     winning_trades INTEGER NOT NULL DEFAULT 0,
                     losing_trades INTEGER NOT NULL DEFAULT 0,
+                    trading_enabled INTEGER NOT NULL DEFAULT 1,
+                    kill_switch_reason TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 )
@@ -135,6 +134,14 @@ class DatabaseManager:
                 )
             """)
 
+            # Add kill switch columns to existing DB if missing
+            c.execute("PRAGMA table_info(account)")
+            cols = [r["name"] for r in c.fetchall()]
+            if "trading_enabled" not in cols:
+                c.execute("ALTER TABLE account ADD COLUMN trading_enabled INTEGER DEFAULT 1")
+            if "kill_switch_reason" not in cols:
+                c.execute("ALTER TABLE account ADD COLUMN kill_switch_reason TEXT")
+
             c.execute("SELECT COUNT(*) as cnt FROM account WHERE mode='PAPER'")
             if c.fetchone()["cnt"] == 0:
                 now = datetime.now().isoformat()
@@ -142,12 +149,17 @@ class DatabaseManager:
                     INSERT INTO account
                         (mode, initial_capital, current_capital, total_pnl,
                          daily_pnl, open_positions, total_trades,
-                         winning_trades, losing_trades, created_at, updated_at)
-                    VALUES (?, ?, ?, 0, 0, 0, 0, 0, 0, ?, ?)
+                         winning_trades, losing_trades, trading_enabled,
+                         created_at, updated_at)
+                    VALUES (?, ?, ?, 0, 0, 0, 0, 0, 0, 1, ?, ?)
                 """, ("PAPER", INITIAL_CAPITAL, INITIAL_CAPITAL, now, now))
                 logger.info(f"Paper account initialised with Rs.{INITIAL_CAPITAL:,.2f}")
 
         logger.info("Database initialised")
+
+    # ------------------------------------------------------------------ #
+    # ACCOUNT
+    # ------------------------------------------------------------------ #
 
     def get_account(self, mode: str = "PAPER") -> Optional[Dict]:
         with self.get_cursor() as c:
@@ -164,6 +176,23 @@ class DatabaseManager:
         values = list(kwargs.values())
         with self.get_cursor() as c:
             c.execute(f"UPDATE account SET {fields} WHERE mode=?", values + [mode])
+
+    def is_trading_enabled(self, mode: str = "PAPER") -> bool:
+        with self.get_cursor() as c:
+            c.execute("SELECT trading_enabled FROM account WHERE mode=?", (mode,))
+            row = c.fetchone()
+            return bool(row["trading_enabled"]) if row and row["trading_enabled"] is not None else True
+
+    def set_trading_enabled(self, enabled: bool, mode: str = "PAPER", reason: str = ""):
+        with self.get_cursor() as c:
+            c.execute(
+                "UPDATE account SET trading_enabled=?, kill_switch_reason=?, updated_at=? WHERE mode=?",
+                (1 if enabled else 0, reason, datetime.now().isoformat(), mode)
+            )
+
+    # ------------------------------------------------------------------ #
+    # POSITIONS
+    # ------------------------------------------------------------------ #
 
     def open_position(self, mode: str, symbol: str, action: str,
                       entry_price: float, quantity: int,
@@ -249,6 +278,10 @@ class DatabaseManager:
                 WHERE id=?
             """, (current_price, unrealized_pnl, pos_id))
 
+    # ------------------------------------------------------------------ #
+    # OPTIONS
+    # ------------------------------------------------------------------ #
+
     def open_option_position(self, mode: str, underlying: str,
                              option_symbol: str, option_type: str,
                              strike: float, expiry: str, premium: float,
@@ -303,6 +336,10 @@ class DatabaseManager:
             row = c.fetchone()
             return dict(row) if row else None
 
+    # ------------------------------------------------------------------ #
+    # STATISTICS
+    # ------------------------------------------------------------------ #
+
     def get_trade_stats(self, mode: str = "PAPER") -> Dict:
         with self.get_cursor() as c:
             c.execute("""
@@ -321,15 +358,12 @@ class DatabaseManager:
                 WHERE mode=? AND status='CLOSED'
             """, (mode,))
             row = dict(c.fetchone())
-
             total = row["total_trades"] or 0
             wins = row["wins"] or 0
             row["win_rate"] = round((wins / total * 100), 2) if total > 0 else 0.0
-
             gross_profit = abs(row["avg_win"] * wins) if wins else 0
             gross_loss = abs(row["avg_loss"] * (row["losses"] or 0))
             row["profit_factor"] = round(gross_profit / gross_loss, 2) if gross_loss > 0 else 0.0
-
             return row
 
     def get_consecutive_losses(self, mode: str = "PAPER") -> int:

@@ -7,7 +7,6 @@ import os
 import logging
 import time
 from datetime import datetime
-from functools import wraps
 
 from flask import Flask, request, jsonify, render_template
 from flask_cors import CORS
@@ -42,7 +41,7 @@ from portfolio import (
 from telegram_notifier import (
     notify_trade_open, notify_trade_close,
     notify_circuit_breaker, notify_startup,
-    test_connection, get_status as tg_status
+    test_connection, get_status as tg_status, send_message
 )
 
 try:
@@ -103,7 +102,7 @@ def verify_webhook_secret(payload: dict):
         raise InvalidWebhookSecretError()
 
 
-def rate_limit(key: str, limit: int = 10, window: int = 60) -> bool:
+def rate_limit(key: str, limit: int = 30, window: int = 60) -> bool:
     rkey = f"rl:{key}"
     try:
         count = redis.incr(rkey)
@@ -113,6 +112,8 @@ def rate_limit(key: str, limit: int = 10, window: int = 60) -> bool:
     except Exception:
         return True
 
+
+# ── Pages ──────────────────────────────────────────────────────────────────
 
 @app.route("/")
 def index():
@@ -134,6 +135,7 @@ def backtesting():
 def options():
     return render_template("options.html")
 
+# ── Health ─────────────────────────────────────────────────────────────────
 
 @app.route("/health")
 @app.route("/api/health")
@@ -144,7 +146,6 @@ def health():
         db_status = "connected"
     except Exception:
         db_status = "error"
-
     return jsonify({
         "status": "healthy",
         "version": "7.0",
@@ -157,8 +158,10 @@ def health():
         "backtesting": "active" if BACKTESTING_AVAILABLE else "unavailable",
         "uptime_seconds": uptime,
         "lot_size": LOT_SIZE,
+        "trading_enabled": db.is_trading_enabled(TRADING_MODE),
     })
 
+# ── Portfolio ──────────────────────────────────────────────────────────────
 
 @app.route("/api/portfolio")
 @app.route("/api/account")
@@ -181,10 +184,7 @@ def api_equity_curve():
         for p in reversed(positions):
             if p.get("pnl") is not None:
                 capital += p["pnl"] - p.get("total_charges", 0)
-                curve.append({
-                    "timestamp": p.get("exit_time", ""),
-                    "capital": round(capital, 2)
-                })
+                curve.append({"timestamp": p.get("exit_time", ""), "capital": round(capital, 2)})
         return jsonify({"success": True, "data": curve,
                         "initial_capital": INITIAL_CAPITAL,
                         "current_capital": account["current_capital"] if account else INITIAL_CAPITAL})
@@ -192,6 +192,7 @@ def api_equity_curve():
         resp, code = handle_exception(e)
         return jsonify(resp), code
 
+# ── Positions ──────────────────────────────────────────────────────────────
 
 @app.route("/api/positions")
 def api_positions():
@@ -199,18 +200,11 @@ def api_positions():
         status = request.args.get("status")
         limit = int(request.args.get("limit", 50))
         symbol = request.args.get("symbol")
-
         positions = db.get_all_positions(TRADING_MODE, status=status, limit=limit)
         if symbol:
             positions = [p for p in positions if p["symbol"] == symbol.upper()]
-
         stats = db.get_trade_stats(TRADING_MODE)
-        return jsonify({
-            "success": True,
-            "positions": positions,
-            "total": len(positions),
-            "stats": stats
-        })
+        return jsonify({"success": True, "positions": positions, "total": len(positions), "stats": stats})
     except Exception as e:
         resp, code = handle_exception(e)
         return jsonify(resp), code
@@ -225,12 +219,44 @@ def api_option_positions():
         resp, code = handle_exception(e)
         return jsonify(resp), code
 
+# ── Kill Switch ────────────────────────────────────────────────────────────
+
+@app.route("/api/kill-switch", methods=["GET", "POST"])
+def kill_switch():
+    if request.method == "GET":
+        trading_enabled = db.is_trading_enabled(TRADING_MODE)
+        account = db.get_account(TRADING_MODE)
+        reason = account.get("kill_switch_reason", "") if account else ""
+        return jsonify({
+            "success": True,
+            "trading_enabled": trading_enabled,
+            "kill_switch_reason": reason
+        })
+
+    try:
+        payload = request.get_json(silent=True) or {}
+        verify_webhook_secret(payload)
+        enabled = bool(payload.get("enabled", True))
+        reason = payload.get("reason", "")
+        db.set_trading_enabled(enabled, TRADING_MODE, reason)
+        status_text = "RESUMED" if enabled else "HALTED"
+        msg = f"Kill switch: Trading {status_text}"
+        if reason:
+            msg += f" - {reason}"
+        send_message(f"*{msg}*\nTime: `{ist_now()}`")
+        logger.info(msg)
+        return jsonify({"success": True, "trading_enabled": enabled, "message": msg})
+    except Exception as e:
+        resp, code = handle_exception(e)
+        return jsonify(resp), code
+
+# ── Webhook ────────────────────────────────────────────────────────────────
 
 @app.route("/api/webhook", methods=["POST"])
 def api_webhook():
     try:
         ip = request.remote_addr or "unknown"
-        if not rate_limit(f"webhook:{ip}", limit=30, window=60):
+        if not rate_limit(f"webhook:{ip}"):
             return jsonify({"success": False, "message": "Rate limit exceeded"}), 429
 
         payload = request.get_json(silent=True)
@@ -283,11 +309,9 @@ def _handle_open(payload: dict, action: str, symbol: str):
     if not is_valid:
         if details.get("circuit_breaker"):
             notify_circuit_breaker(details["message"])
-        return jsonify({"success": False, "message": details["message"],
-                        "details": details}), 400
+        return jsonify({"success": False, "message": details["message"], "details": details}), 400
 
     charges = calculate_equity_charges(entry, qty, "BUY")
-
     pos_id = db.open_position(
         mode=TRADING_MODE, symbol=symbol, action=action,
         entry_price=entry, quantity=qty,
@@ -297,23 +321,16 @@ def _handle_open(payload: dict, action: str, symbol: str):
     )
 
     account = db.get_account(TRADING_MODE)
-    db.update_account(
-        TRADING_MODE,
-        current_capital=round(account["current_capital"] - charges, 2)
-    )
+    db.update_account(TRADING_MODE, current_capital=round(account["current_capital"] - charges, 2))
 
     notify_trade_open(symbol, action, entry, qty, sl, tp, pos_id, charges)
     logger.info(f"Position opened: {action} {symbol} @ Rs.{entry} qty={qty}")
 
     return jsonify({
-        "success": True,
-        "message": "Position opened",
-        "position_id": pos_id,
-        "symbol": symbol,
-        "action": action,
-        "entry_price": entry,
-        "quantity": qty,
-        "charges": charges,
+        "success": True, "message": "Position opened",
+        "position_id": pos_id, "symbol": symbol,
+        "action": action, "entry_price": entry,
+        "quantity": qty, "charges": charges,
     })
 
 
@@ -338,8 +355,7 @@ def _handle_exit(payload: dict, symbol: str):
     logger.info(f"Position closed: {symbol} @ Rs.{exit_price} pnl=Rs.{result['net_pnl']}")
 
     return jsonify({
-        "success": True,
-        "message": "Position closed",
+        "success": True, "message": "Position closed",
         "position_id": position["id"],
         "exit_price": exit_price,
         "pnl": result["gross_pnl"],
@@ -360,11 +376,9 @@ def _handle_open_option(payload: dict, symbol: str):
     tp = float(payload.get("tp", 0)) or None
 
     if not option_symbol or premium <= 0:
-        return jsonify({"success": False,
-                        "message": "option_symbol and premium required"}), 400
+        return jsonify({"success": False, "message": "option_symbol and premium required"}), 400
 
     charges = calculate_option_charges(premium, qty, "BUY")
-
     pos_id = db.open_option_position(
         mode=TRADING_MODE, underlying=symbol,
         option_symbol=option_symbol, option_type=option_type,
@@ -375,23 +389,15 @@ def _handle_open_option(payload: dict, symbol: str):
 
     account = db.get_account(TRADING_MODE)
     cost = premium * qty + charges
-    db.update_account(
-        TRADING_MODE,
-        current_capital=round(account["current_capital"] - cost, 2)
-    )
+    db.update_account(TRADING_MODE, current_capital=round(account["current_capital"] - cost, 2))
 
-    notify_trade_open(option_symbol, f"BUY {option_type}",
-                      premium, qty, sl, tp, pos_id, charges)
+    notify_trade_open(option_symbol, f"BUY {option_type}", premium, qty, sl, tp, pos_id, charges)
     logger.info(f"Option opened: {option_symbol} @ Rs.{premium} qty={qty}")
 
     return jsonify({
-        "success": True,
-        "message": "Option position opened",
-        "position_id": pos_id,
-        "option_symbol": option_symbol,
-        "premium": premium,
-        "quantity": qty,
-        "charges": charges,
+        "success": True, "message": "Option position opened",
+        "position_id": pos_id, "option_symbol": option_symbol,
+        "premium": premium, "quantity": qty, "charges": charges,
     })
 
 
@@ -400,8 +406,7 @@ def _handle_exit_option(payload: dict, symbol: str):
     exit_premium = float(payload.get("premium", 0))
 
     if not option_symbol:
-        return jsonify({"success": False,
-                        "message": "option_symbol required for EXIT_OPTION"}), 400
+        return jsonify({"success": False, "message": "option_symbol required for EXIT_OPTION"}), 400
 
     position = db.get_open_option_by_symbol(option_symbol, TRADING_MODE)
     if not position:
@@ -410,23 +415,17 @@ def _handle_exit_option(payload: dict, symbol: str):
     reason = payload.get("exit_reason", "Signal Exit")
     result = portfolio.apply_trade_close(position, exit_premium, reason, TRADING_MODE)
 
-    notify_trade_close(
-        option_symbol, "SELL",
-        position["premium"], exit_premium,
-        position["quantity"], result["gross_pnl"],
-        reason, result["total_charges"]
-    )
+    notify_trade_close(option_symbol, "SELL", position["premium"], exit_premium,
+                       position["quantity"], result["gross_pnl"], reason, result["total_charges"])
 
     return jsonify({
-        "success": True,
-        "message": "Option position closed",
-        "position_id": position["id"],
-        "exit_premium": exit_premium,
-        "pnl": result["gross_pnl"],
-        "net_pnl": result["net_pnl"],
+        "success": True, "message": "Option position closed",
+        "position_id": position["id"], "exit_premium": exit_premium,
+        "pnl": result["gross_pnl"], "net_pnl": result["net_pnl"],
         "charges": result["total_charges"],
     })
 
+# ── Analysis ───────────────────────────────────────────────────────────────
 
 @app.route("/api/analysis/quick")
 def api_analysis_quick():
@@ -460,7 +459,6 @@ def api_market_status():
     hour = now_ist.hour
     minute = now_ist.minute
     weekday = now_ist.weekday()
-
     if weekday >= 5:
         status = "CLOSED"
     elif (hour == 9 and minute >= 15) or (10 <= hour < 15) or (hour == 15 and minute <= 15):
@@ -469,7 +467,6 @@ def api_market_status():
         status = "PRE_OPEN"
     else:
         status = "CLOSED"
-
     return jsonify({
         "status": status,
         "current_time_ist": now_ist.strftime("%H:%M:%S"),
@@ -479,6 +476,7 @@ def api_market_status():
         "is_weekday": weekday < 5,
     })
 
+# ── Risk ───────────────────────────────────────────────────────────────────
 
 @app.route("/api/risk/report")
 def api_risk_report():
@@ -498,28 +496,19 @@ def api_risk_validate():
         entry = float(data.get("price", 0))
         sl = float(data.get("sl", 0))
         tp = float(data.get("tp", 0))
-
-        is_valid, details = risk_mgr.validate_new_trade(
-            symbol, entry, sl, tp, TRADING_MODE
-        )
+        is_valid, details = risk_mgr.validate_new_trade(symbol, entry, sl, tp, TRADING_MODE)
         size = risk_mgr.calculate_position_size(entry, sl, TRADING_MODE) if is_valid else 0
-
-        return jsonify({
-            "success": True,
-            "accepted": is_valid,
-            "details": details,
-            "recommended_quantity": size,
-        })
+        return jsonify({"success": True, "accepted": is_valid, "details": details, "recommended_quantity": size})
     except Exception as e:
         resp, code = handle_exception(e)
         return jsonify(resp), code
 
+# ── Backtesting ────────────────────────────────────────────────────────────
 
 @app.route("/api/backtest", methods=["POST"])
 def api_backtest():
     if not BACKTESTING_AVAILABLE:
-        return jsonify({"success": False,
-                        "error": "Backtesting not available"}), 503
+        return jsonify({"success": False, "error": "Backtesting not available"}), 503
     try:
         data = request.get_json(silent=True) or {}
         result = backtester.run(
@@ -534,6 +523,7 @@ def api_backtest():
         resp, code = handle_exception(e)
         return jsonify(resp), code
 
+# ── Telegram ───────────────────────────────────────────────────────────────
 
 @app.route("/api/telegram/test")
 def api_telegram_test():
@@ -546,6 +536,7 @@ def api_telegram_test():
 def api_telegram_status():
     return jsonify(tg_status())
 
+# ── System ─────────────────────────────────────────────────────────────────
 
 @app.route("/api/system/info")
 def api_system_info():
@@ -562,8 +553,10 @@ def api_system_info():
         "python_version": sys.version.split()[0],
         "flask_version": flask_ver,
         "uptime_seconds": int(time.time() - START_TIME),
+        "trading_enabled": db.is_trading_enabled(TRADING_MODE),
     })
 
+# ── Error handlers ─────────────────────────────────────────────────────────
 
 @app.errorhandler(404)
 def not_found(e):
@@ -578,6 +571,7 @@ def internal_error(e):
     logger.error(f"Internal error: {e}")
     return jsonify({"success": False, "message": "Internal server error"}), 500
 
+# ── Startup ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     logger.info("=" * 60)
@@ -586,12 +580,5 @@ if __name__ == "__main__":
     logger.info(f"Capital: Rs.{INITIAL_CAPITAL:,.2f}")
     logger.info(f"Lot:     {LOT_SIZE} units")
     logger.info("=" * 60)
-
     notify_startup(INITIAL_CAPITAL, TRADING_MODE)
-
-    app.run(
-        host="0.0.0.0",
-        port=PORT,
-        debug=False,
-        use_reloader=False
-    )
+    app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)

@@ -1,12 +1,10 @@
 ﻿#!/usr/bin/env python3
 """
 Risk Manager - Paper Trading System v7.0
-Handles position sizing, drawdown protection, and circuit breakers.
 """
 
 import logging
-from datetime import datetime
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple
 
 from config import (
     ENABLE_RISK_MANAGEMENT, POSITION_SIZING_METHOD,
@@ -38,6 +36,11 @@ class RiskManager:
         account = self.db.get_account(mode)
         if not account:
             return False, {"message": "Account not found"}
+
+        # Kill switch check — blocks all new entries
+        if not self.db.is_trading_enabled(mode):
+            reason = account.get("kill_switch_reason") or "Trading manually halted"
+            return False, {"message": f"Kill switch active: {reason}", "circuit_breaker": True}
 
         capital = account["current_capital"]
 
@@ -125,7 +128,6 @@ class RiskManager:
         risk_amt = capital * (RISK_PER_TRADE_PERCENT / 100) * multiplier
 
         risk_per_unit = abs(entry - sl) if sl and entry else entry * 0.005
-
         if risk_per_unit == 0:
             return LOT_SIZE
 
@@ -156,14 +158,11 @@ class RiskManager:
         if total < 10:
             risk_amt = capital * (RISK_PER_TRADE_PERCENT / 100)
             return int(risk_amt / risk_per_unit)
-
         win_rate = stats.get("win_rate", 50) / 100
         avg_win = abs(stats.get("avg_win", 1))
         avg_loss = abs(stats.get("avg_loss", 1))
-
         if avg_loss == 0:
             return LOT_SIZE
-
         rr = avg_win / avg_loss
         kelly = win_rate - ((1 - win_rate) / rr)
         kelly = max(0, kelly * KELLY_FRACTION)
@@ -182,11 +181,18 @@ class RiskManager:
         open_pos = self.db.get_open_positions(mode)
         heat = self._calculate_portfolio_heat(open_pos, capital)
         multiplier = self._size_multiplier(capital)
+        trading_enabled = self.db.is_trading_enabled(mode)
 
         can_trade, cb_reason = self._check_circuit_breakers(account, mode)
 
+        # Kill switch overrides everything
+        if not trading_enabled:
+            can_trade = False
+            cb_reason = account.get("kill_switch_reason") or "Kill switch active"
+
         return {
             "can_trade": can_trade,
+            "kill_switch_active": not trading_enabled,
             "circuit_breaker_active": not can_trade,
             "circuit_breaker_reason": cb_reason if not can_trade else None,
             "current_drawdown": round(drawdown, 2),
@@ -208,10 +214,8 @@ class RiskManager:
                              current_price: float) -> Tuple[bool, str]:
         if not USE_TRAILING_STOPS:
             return False, ""
-
         entry = position.get("entry_price", 0)
         action = position.get("action", "BUY")
-
         if action.upper() in ("BUY", "LONG"):
             gain_pct = ((current_price - entry) / entry) * 100
             if gain_pct >= TRAILING_STOP_ACTIVATION:
@@ -226,7 +230,6 @@ class RiskManager:
                 sl = position.get("stop_loss", 0)
                 if sl and current_price >= trail_price:
                     return True, f"Trailing stop hit at Rs.{current_price:,.2f}"
-
         return False, ""
 
 

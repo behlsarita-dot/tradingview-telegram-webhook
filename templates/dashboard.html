@@ -45,7 +45,10 @@
   <div class="card" id="risk-panel">
     <div class="card-header">
       <h2>Risk Status</h2>
-      <span id="trading-status" class="badge badge-green">ACTIVE</span>
+      <div style="display:flex; gap:8px; align-items:center;">
+        <span id="trading-status" class="badge badge-green">ACTIVE</span>
+        <button id="kill-switch-btn" onclick="toggleKillSwitch()" class="btn btn-sm btn-danger">Halt Trading</button>
+      </div>
     </div>
     <div class="grid-3">
       <div class="metric">

@@ -6,14 +6,14 @@ async function loadDashboard() {
     loadRisk(),
     loadPositions(),
     loadRecentTrades(),
-    loadMarketStatus()
+    loadMarketStatus(),
+    loadKillSwitch()
   ]);
 }
 
 async function loadPortfolio() {
   const res = await api("/api/portfolio");
   if (!res.success) return;
-
   setEl("capital", `Rs.${fmt(res.current_capital)}`);
   setEl("roi", `ROI: ${res.roi_pct >= 0 ? "+" : ""}${fmt(res.roi_pct)}%`);
   setEl("daily-pnl", fmtPnl(res.daily_pnl), true);
@@ -35,43 +35,75 @@ async function loadRisk() {
   const badge = document.getElementById("trading-status");
   const cbMsg = document.getElementById("circuit-breaker-msg");
 
-  if (res.can_trade) {
-    badge.textContent = "ACTIVE";
-    badge.className = "badge badge-green";
-    cbMsg.style.display = "none";
-  } else {
+  if (res.kill_switch_active) {
     badge.textContent = "HALTED";
     badge.className = "badge badge-red";
     cbMsg.style.display = "block";
-    cbMsg.textContent = res.circuit_breaker_reason;
-  }
-
-  if (res.recovery_mode) {
+    cbMsg.textContent = "Kill switch active: " + (res.circuit_breaker_reason || "Trading manually halted");
+  } else if (!res.can_trade) {
+    badge.textContent = "HALTED";
+    badge.className = "badge badge-red";
+    cbMsg.style.display = "block";
+    cbMsg.textContent = res.circuit_breaker_reason || "Circuit breaker active";
+  } else if (res.recovery_mode) {
     badge.textContent = "RECOVERY";
     badge.className = "badge badge-yellow";
+    cbMsg.style.display = "none";
+  } else {
+    badge.textContent = "ACTIVE";
+    badge.className = "badge badge-green";
+    cbMsg.style.display = "none";
+  }
+}
+
+async function loadKillSwitch() {
+  const res = await api("/api/kill-switch");
+  if (!res.success) return;
+  const btn = document.getElementById("kill-switch-btn");
+  if (res.trading_enabled) {
+    btn.textContent = "Halt Trading";
+    btn.className = "btn btn-sm btn-danger";
+  } else {
+    btn.textContent = "Resume Trading";
+    btn.className = "btn btn-sm";
+    btn.style.background = "#22c55e";
+  }
+}
+
+async function toggleKillSwitch() {
+  const current = await api("/api/kill-switch");
+  const willEnable = !current.trading_enabled;
+  const action = willEnable ? "RESUME" : "HALT";
+  const secret = prompt(`Enter webhook secret to ${action} trading:`);
+  if (!secret) return;
+  const reason = willEnable ? "" : (prompt("Reason for halting (optional):") || "Manual halt");
+  const res = await postApi("/api/kill-switch", {
+    webhook_secret: secret,
+    enabled: willEnable,
+    reason: reason
+  });
+  if (res.success) {
+    alert(willEnable ? "Trading RESUMED." : "Trading HALTED. No new positions will open.");
+    loadDashboard();
+  } else {
+    alert("Failed: " + (res.message || "Check webhook secret"));
   }
 }
 
 async function loadPositions() {
   const res = await api("/api/positions?status=OPEN&limit=20");
   const cont = document.getElementById("positions-container");
-
   if (!res.success || !res.positions || res.positions.length === 0) {
     cont.innerHTML = "<div class=\"empty-state\">No open positions</div>";
     return;
   }
-
   cont.innerHTML = res.positions.map(p => {
     const isBuy = ["BUY", "LONG"].includes(p.action);
     return `
       <div class="position-row">
         <div class="pos-symbol ${isBuy ? "green" : "red"}">${p.symbol}</div>
-        <div>
-          <span class="badge ${isBuy ? "badge-green" : "badge-red"}">${p.action}</span>
-        </div>
-        <div class="pos-detail">
-          Entry Rs.${fmt(p.entry_price)} | Qty ${p.quantity}
-        </div>
+        <div><span class="badge ${isBuy ? "badge-green" : "badge-red"}">${p.action}</span></div>
+        <div class="pos-detail">Entry Rs.${fmt(p.entry_price)} | Qty ${p.quantity}</div>
         <div class="pos-detail">
           SL ${p.stop_loss ? "Rs." + fmt(p.stop_loss) : "--"} |
           TP ${p.take_profit ? "Rs." + fmt(p.take_profit) : "--"}
@@ -86,12 +118,10 @@ async function loadPositions() {
 async function loadRecentTrades() {
   const res = await api("/api/positions?status=CLOSED&limit=10");
   const cont = document.getElementById("trades-container");
-
   if (!res.success || !res.positions || res.positions.length === 0) {
     cont.innerHTML = "<div class=\"empty-state\">No closed trades yet</div>";
     return;
   }
-
   const rows = res.positions.map(p => `
     <tr>
       <td>${p.symbol}</td>
@@ -103,14 +133,10 @@ async function loadRecentTrades() {
       <td class="text-muted">${timeAgo(p.exit_time)}</td>
     </tr>
   `).join("");
-
   cont.innerHTML = `
     <table class="trades-table">
       <thead>
-        <tr>
-          <th>Symbol</th><th>Action</th><th>Entry</th>
-          <th>Exit</th><th>P&L</th><th>Reason</th><th>When</th>
-        </tr>
+        <tr><th>Symbol</th><th>Action</th><th>Entry</th><th>Exit</th><th>P&L</th><th>Reason</th><th>When</th></tr>
       </thead>
       <tbody>${rows}</tbody>
     </table>
