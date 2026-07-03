@@ -1,6 +1,7 @@
 ﻿#!/usr/bin/env python3
 """
 Paper Trading System v7.0 - Main Flask Application
+Auto-closes all positions at 3:20 PM IST (intraday only)
 """
 
 import os
@@ -113,7 +114,176 @@ def rate_limit(key: str, limit: int = 30, window: int = 60) -> bool:
         return True
 
 
-# Pages
+# ── EOD Auto-Close ─────────────────────────────────────────────────────────
+
+def close_all_positions_eod():
+    """
+    Close all open positions at 3:20 PM IST.
+    Called by APScheduler every weekday at 15:20 IST.
+    """
+    now_ist = datetime.now(IST)
+    logger.info(f"EOD auto-close triggered at {now_ist.strftime('%H:%M:%S IST')}")
+
+    try:
+        # Get current price for closing (use yfinance or fallback)
+        close_price = _get_nifty_price()
+
+        open_positions = db.get_open_positions(TRADING_MODE)
+        open_options = db.get_open_option_positions(TRADING_MODE)
+
+        total = len(open_positions) + len(open_options)
+
+        if total == 0:
+            logger.info("EOD close: no open positions")
+            return
+
+        send_message(
+            f"*EOD AUTO-CLOSE TRIGGERED*\n"
+            f"Closing {total} position(s) at 3:20 PM IST\n"
+            f"Price: Rs.{close_price:,.2f}\n"
+            f"Time: `{ist_now()}`"
+        )
+
+        # Close equity/futures positions
+        for pos in open_positions:
+            try:
+                result = portfolio.apply_trade_close(
+                    pos, close_price, "EOD Auto-Close 15:20", TRADING_MODE
+                )
+                notify_trade_close(
+                    pos["symbol"], pos["action"],
+                    pos["entry_price"], close_price,
+                    pos["quantity"], result["gross_pnl"],
+                    "EOD Auto-Close 15:20", result["total_charges"]
+                )
+                logger.info(
+                    f"EOD closed: {pos['action']} {pos['symbol']} "
+                    f"pnl=Rs.{result['net_pnl']:,.2f}"
+                )
+            except Exception as e:
+                logger.error(f"EOD close failed for position {pos['id']}: {e}")
+
+        # Close option positions
+        for pos in open_options:
+            try:
+                option_price = _get_option_price(pos) or pos["premium"] * 0.1
+                result = portfolio.apply_trade_close(
+                    pos, option_price, "EOD Auto-Close 15:20", TRADING_MODE
+                )
+                notify_trade_close(
+                    pos["option_symbol"], "SELL",
+                    pos["premium"], option_price,
+                    pos["quantity"], result["gross_pnl"],
+                    "EOD Auto-Close 15:20", result["total_charges"]
+                )
+                logger.info(f"EOD closed option: {pos['option_symbol']} pnl=Rs.{result['net_pnl']:,.2f}")
+            except Exception as e:
+                logger.error(f"EOD close failed for option {pos['id']}: {e}")
+
+        # Summary
+        account = db.get_account(TRADING_MODE)
+        send_message(
+            f"*EOD CLOSE COMPLETE*\n"
+            f"Closed: {total} position(s)\n"
+            f"Capital: Rs.{account['current_capital']:,.2f}\n"
+            f"Today P&L: Rs.{db.get_daily_pnl(TRADING_MODE):+,.2f}"
+        )
+
+    except Exception as e:
+        logger.error(f"EOD auto-close error: {e}")
+        send_message(f"*EOD AUTO-CLOSE ERROR*\n{str(e)}")
+
+
+def _get_nifty_price() -> float:
+    """Get current NIFTY price for EOD close."""
+    try:
+        import yfinance as yf
+        ticker = yf.Ticker("^NSEI")
+        data = ticker.history(period="1d", interval="1m")
+        if not data.empty:
+            return round(float(data["Close"].iloc[-1]), 2)
+    except Exception:
+        pass
+    # Fallback to last known price from open positions
+    try:
+        positions = db.get_open_positions(TRADING_MODE)
+        if positions:
+            return float(positions[0].get("current_price") or positions[0]["entry_price"])
+    except Exception:
+        pass
+    return 24400.0  # absolute fallback
+
+
+def _get_option_price(pos: dict) -> float:
+    """Get current option price — returns None if unavailable."""
+    try:
+        import yfinance as yf
+        symbol = pos.get("option_symbol", "")
+        if symbol:
+            ticker = yf.Ticker(f"{symbol}.NS")
+            data = ticker.history(period="1d", interval="1m")
+            if not data.empty:
+                return round(float(data["Close"].iloc[-1]), 2)
+    except Exception:
+        pass
+    return None
+
+
+def start_scheduler():
+    """Start APScheduler for EOD auto-close at 15:20 IST weekdays."""
+    try:
+        from apscheduler.schedulers.background import BackgroundScheduler
+
+        scheduler = BackgroundScheduler(timezone=IST)
+
+        # EOD close at 3:20 PM IST, Monday-Friday
+        scheduler.add_job(
+            close_all_positions_eod,
+            trigger="cron",
+            hour=15,
+            minute=20,
+            day_of_week="mon-fri",
+            id="eod_close",
+            replace_existing=True
+        )
+
+        # Block new entries after 3:15 PM (market close)
+        scheduler.add_job(
+            lambda: db.set_trading_enabled(False, TRADING_MODE, "Market closed 15:15")
+            if db.is_trading_enabled(TRADING_MODE) else None,
+            trigger="cron",
+            hour=15,
+            minute=15,
+            day_of_week="mon-fri",
+            id="block_new_entries",
+            replace_existing=True
+        )
+
+        # Re-enable trading at 9:10 AM IST (pre-market)
+        scheduler.add_job(
+            lambda: db.set_trading_enabled(True, TRADING_MODE, ""),
+            trigger="cron",
+            hour=9,
+            minute=10,
+            day_of_week="mon-fri",
+            id="enable_trading",
+            replace_existing=True
+        )
+
+        scheduler.start()
+        logger.info("Scheduler started: EOD close at 15:20, block at 15:15, enable at 09:10 IST")
+        return scheduler
+
+    except Exception as e:
+        logger.error(f"Scheduler failed to start: {e}")
+        return None
+
+
+# Start scheduler
+scheduler = start_scheduler()
+
+
+# ── Pages ──────────────────────────────────────────────────────────────────
 
 @app.route("/")
 def index():
@@ -135,7 +305,7 @@ def backtesting():
 def options():
     return render_template("options.html")
 
-# Health
+# ── Health ─────────────────────────────────────────────────────────────────
 
 @app.route("/health")
 @app.route("/api/health")
@@ -159,9 +329,10 @@ def health():
         "uptime_seconds": uptime,
         "lot_size": LOT_SIZE,
         "trading_enabled": db.is_trading_enabled(TRADING_MODE),
+        "scheduler": "active" if scheduler else "inactive",
     })
 
-# Portfolio
+# ── Portfolio ──────────────────────────────────────────────────────────────
 
 @app.route("/api/portfolio")
 @app.route("/api/account")
@@ -192,7 +363,7 @@ def api_equity_curve():
         resp, code = handle_exception(e)
         return jsonify(resp), code
 
-# Positions
+# ── Positions ──────────────────────────────────────────────────────────────
 
 @app.route("/api/positions")
 def api_positions():
@@ -219,7 +390,7 @@ def api_option_positions():
         resp, code = handle_exception(e)
         return jsonify(resp), code
 
-# Kill Switch
+# ── Kill Switch ────────────────────────────────────────────────────────────
 
 @app.route("/api/kill-switch", methods=["GET", "POST"])
 def kill_switch():
@@ -232,7 +403,6 @@ def kill_switch():
             "trading_enabled": trading_enabled,
             "kill_switch_reason": reason
         })
-
     try:
         payload = request.get_json(silent=True) or {}
         verify_webhook_secret(payload)
@@ -250,7 +420,22 @@ def kill_switch():
         resp, code = handle_exception(e)
         return jsonify(resp), code
 
-# Webhook
+
+# ── EOD Manual Trigger ─────────────────────────────────────────────────────
+
+@app.route("/api/eod-close", methods=["POST"])
+def api_eod_close():
+    """Manually trigger EOD close (requires webhook secret)."""
+    try:
+        payload = request.get_json(silent=True) or {}
+        verify_webhook_secret(payload)
+        close_all_positions_eod()
+        return jsonify({"success": True, "message": "EOD close triggered"})
+    except Exception as e:
+        resp, code = handle_exception(e)
+        return jsonify(resp), code
+
+# ── Webhook ────────────────────────────────────────────────────────────────
 
 @app.route("/api/webhook", methods=["POST"])
 def api_webhook():
@@ -295,6 +480,14 @@ def _handle_open(payload: dict, action: str, symbol: str):
     entry = float(payload.get("price", 0))
     if entry <= 0:
         return jsonify({"success": False, "message": "Valid price required"}), 400
+
+    # Block new entries after 3:00 PM IST
+    now_ist = datetime.now(IST)
+    if now_ist.hour >= 15 and now_ist.minute >= 0:
+        return jsonify({
+            "success": False,
+            "message": "New entries blocked after 3:00 PM IST (intraday only)"
+        }), 400
 
     qty = int(payload.get("quantity", LOT_SIZE))
     sl = float(payload.get("sl", 0)) or None
@@ -425,7 +618,7 @@ def _handle_exit_option(payload: dict, symbol: str):
         "charges": result["total_charges"],
     })
 
-# Analysis
+# ── Analysis ───────────────────────────────────────────────────────────────
 
 @app.route("/api/analysis/quick")
 def api_analysis_quick():
@@ -472,11 +665,12 @@ def api_market_status():
         "current_time_ist": now_ist.strftime("%H:%M:%S"),
         "opens_at": "09:15",
         "closes_at": "15:15",
+        "eod_close": "15:20",
         "timezone": "Asia/Kolkata",
         "is_weekday": weekday < 5,
     })
 
-# Risk
+# ── Risk ───────────────────────────────────────────────────────────────────
 
 @app.route("/api/risk/report")
 def api_risk_report():
@@ -503,7 +697,7 @@ def api_risk_validate():
         resp, code = handle_exception(e)
         return jsonify(resp), code
 
-# Backtesting
+# ── Backtesting ────────────────────────────────────────────────────────────
 
 @app.route("/api/backtest", methods=["POST"])
 def api_backtest():
@@ -523,7 +717,7 @@ def api_backtest():
         resp, code = handle_exception(e)
         return jsonify(resp), code
 
-# Telegram
+# ── Telegram ───────────────────────────────────────────────────────────────
 
 @app.route("/api/telegram/test")
 def api_telegram_test():
@@ -536,7 +730,7 @@ def api_telegram_test():
 def api_telegram_status():
     return jsonify(tg_status())
 
-# System
+# ── System ─────────────────────────────────────────────────────────────────
 
 @app.route("/api/system/info")
 def api_system_info():
@@ -554,9 +748,10 @@ def api_system_info():
         "flask_version": flask_ver,
         "uptime_seconds": int(time.time() - START_TIME),
         "trading_enabled": db.is_trading_enabled(TRADING_MODE),
+        "scheduler": "active" if scheduler else "inactive",
     })
 
-# Error handlers
+# ── Error handlers ─────────────────────────────────────────────────────────
 
 @app.errorhandler(404)
 def not_found(e):
@@ -571,7 +766,7 @@ def internal_error(e):
     logger.error(f"Internal error: {e}")
     return jsonify({"success": False, "message": "Internal server error"}), 500
 
-# Startup
+# ── Startup ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     logger.info("=" * 60)
@@ -579,6 +774,7 @@ if __name__ == "__main__":
     logger.info(f"Mode:    {TRADING_MODE}")
     logger.info(f"Capital: Rs.{INITIAL_CAPITAL:,.2f}")
     logger.info(f"Lot:     {LOT_SIZE} units")
+    logger.info("EOD auto-close: 15:20 IST weekdays")
     logger.info("=" * 60)
     notify_startup(INITIAL_CAPITAL, TRADING_MODE)
     app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
