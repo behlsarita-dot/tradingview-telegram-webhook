@@ -90,6 +90,56 @@ async function toggleKillSwitch() {
   }
 }
 
+async function emergencyCloseAll() {
+  const sure = confirm("This will IMMEDIATELY close ALL open positions and halt trading. This cannot be undone. Continue?");
+  if (!sure) return;
+
+  const secret = prompt("Enter webhook secret to confirm EMERGENCY CLOSE ALL:");
+  if (!secret) return;
+
+  const priceInput = prompt(
+    "Exit price to close positions at (leave blank to close at entry price with zero P&L):"
+  );
+  const reason = prompt("Reason for emergency close:") || "Manual emergency close";
+
+  const body = { webhook_secret: secret, reason: reason };
+  if (priceInput && priceInput.trim() !== "") {
+    body.exit_price = parseFloat(priceInput);
+  }
+
+  const res = await postApi("/api/emergency-close", body);
+
+  if (res.success) {
+    alert(`Closed ${res.closed_count} position(s). Trading is now halted.`);
+    loadDashboard();
+  } else {
+    alert("Failed: " + (res.message || "Check webhook secret"));
+  }
+}
+
+async function closePosition(symbol) {
+  const price = prompt(`Enter current price to close ${symbol} position:`);
+  if (!price || isNaN(parseFloat(price))) return;
+
+  const secret = prompt("Enter webhook secret to confirm close:");
+  if (!secret) return;
+
+  const res = await postApi("/api/webhook", {
+    webhook_secret: secret,
+    symbol: symbol,
+    action: "EXIT",
+    price: parseFloat(price),
+    exit_reason: "Manual close"
+  });
+
+  if (res.success) {
+    alert(`Closed ${symbol} at Rs.${price}. P&L: Rs.${res.net_pnl}`);
+    loadDashboard();
+  } else {
+    alert("Failed: " + (res.message || "check price/secret"));
+  }
+}
+
 async function loadPositions() {
   const res = await api("/api/positions?status=OPEN&limit=20");
   const cont = document.getElementById("positions-container");
@@ -110,6 +160,7 @@ async function loadPositions() {
         </div>
         <div class="pos-pnl">${fmtPnl(p.unrealized_pnl)}</div>
         <div class="pos-time">${timeAgo(p.entry_time)}</div>
+        <button onclick="closePosition('${p.symbol}')" class="btn btn-sm btn-danger">Close</button>
       </div>
     `;
   }).join("");

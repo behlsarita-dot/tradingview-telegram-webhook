@@ -113,7 +113,7 @@ def rate_limit(key: str, limit: int = 30, window: int = 60) -> bool:
         return True
 
 
-# ── Pages ──────────────────────────────────────────────────────────────────
+# Pages
 
 @app.route("/")
 def index():
@@ -135,7 +135,7 @@ def backtesting():
 def options():
     return render_template("options.html")
 
-# ── Health ─────────────────────────────────────────────────────────────────
+# Health
 
 @app.route("/health")
 @app.route("/api/health")
@@ -161,7 +161,7 @@ def health():
         "trading_enabled": db.is_trading_enabled(TRADING_MODE),
     })
 
-# ── Portfolio ──────────────────────────────────────────────────────────────
+# Portfolio
 
 @app.route("/api/portfolio")
 @app.route("/api/account")
@@ -192,7 +192,7 @@ def api_equity_curve():
         resp, code = handle_exception(e)
         return jsonify(resp), code
 
-# ── Positions ──────────────────────────────────────────────────────────────
+# Positions
 
 @app.route("/api/positions")
 def api_positions():
@@ -219,7 +219,7 @@ def api_option_positions():
         resp, code = handle_exception(e)
         return jsonify(resp), code
 
-# ── Kill Switch ────────────────────────────────────────────────────────────
+# Kill Switch
 
 @app.route("/api/kill-switch", methods=["GET", "POST"])
 def kill_switch():
@@ -250,7 +250,7 @@ def kill_switch():
         resp, code = handle_exception(e)
         return jsonify(resp), code
 
-# ── Webhook ────────────────────────────────────────────────────────────────
+# Webhook
 
 @app.route("/api/webhook", methods=["POST"])
 def api_webhook():
@@ -425,7 +425,7 @@ def _handle_exit_option(payload: dict, symbol: str):
         "charges": result["total_charges"],
     })
 
-# ── Analysis ───────────────────────────────────────────────────────────────
+# Analysis
 
 @app.route("/api/analysis/quick")
 def api_analysis_quick():
@@ -476,7 +476,7 @@ def api_market_status():
         "is_weekday": weekday < 5,
     })
 
-# ── Risk ───────────────────────────────────────────────────────────────────
+# Risk
 
 @app.route("/api/risk/report")
 def api_risk_report():
@@ -503,7 +503,7 @@ def api_risk_validate():
         resp, code = handle_exception(e)
         return jsonify(resp), code
 
-# ── Backtesting ────────────────────────────────────────────────────────────
+# Backtesting
 
 @app.route("/api/backtest", methods=["POST"])
 def api_backtest():
@@ -523,7 +523,7 @@ def api_backtest():
         resp, code = handle_exception(e)
         return jsonify(resp), code
 
-# ── Telegram ───────────────────────────────────────────────────────────────
+# Telegram
 
 @app.route("/api/telegram/test")
 def api_telegram_test():
@@ -536,7 +536,7 @@ def api_telegram_test():
 def api_telegram_status():
     return jsonify(tg_status())
 
-# ── System ─────────────────────────────────────────────────────────────────
+# System
 
 @app.route("/api/system/info")
 def api_system_info():
@@ -556,7 +556,7 @@ def api_system_info():
         "trading_enabled": db.is_trading_enabled(TRADING_MODE),
     })
 
-# ── Error handlers ─────────────────────────────────────────────────────────
+# Error handlers
 
 @app.errorhandler(404)
 def not_found(e):
@@ -571,7 +571,7 @@ def internal_error(e):
     logger.error(f"Internal error: {e}")
     return jsonify({"success": False, "message": "Internal server error"}), 500
 
-# ── Startup ────────────────────────────────────────────────────────────────
+# Startup
 
 if __name__ == "__main__":
     logger.info("=" * 60)
