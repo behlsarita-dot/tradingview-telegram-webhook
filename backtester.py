@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 Backtester - Paper Trading System v7.0
 Simple vectorised backtest on yfinance OHLCV data.
@@ -20,7 +20,7 @@ except ImportError:
     LIBS_AVAILABLE = False
 
 from config import INITIAL_CAPITAL, LOT_SIZE
-from portfolio import calculate_option_charges
+from portfolio import calculate_equity_charges
 
 SYMBOL_MAP = {
     "NIFTY": "^NSEI",
@@ -150,8 +150,8 @@ class Backtester:
                     pnl = ((exit_price - entry_price) * LOT_SIZE
                            if direction == "BUY"
                            else (entry_price - exit_price) * LOT_SIZE)
-                    charges = (calculate_option_charges(entry_price, LOT_SIZE, "BUY") +
-                               calculate_option_charges(exit_price, LOT_SIZE, "SELL"))
+                    charges = (calculate_equity_charges(entry_price, LOT_SIZE, "BUY") +
+                               calculate_equity_charges(exit_price, LOT_SIZE, "SELL"))
                     net_pnl = pnl - charges
                     capital += net_pnl
 
