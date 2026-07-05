@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
 Telegram Notifier - Paper Trading System v7.0
-Pure synchronous telebot implementation. No async loops.
+Pure synchronous telebot implementation, dispatched via background threads
+so that Telegram API latency never blocks the Flask webhook response.
 """
 
 import logging
+import threading
 import requests
 from datetime import datetime
 from typing import Optional
@@ -43,7 +45,22 @@ def _get_bot():
     return _bot
 
 
+def _send_async(func, *args, **kwargs):
+    """
+    Run a notification function in a background thread so it never blocks
+    the Flask request/response cycle (e.g. the /api/webhook route).
+    Daemon=True ensures these threads never prevent process shutdown.
+    """
+    threading.Thread(target=func, args=args, kwargs=kwargs, daemon=True).start()
+
+
 def send_message(text: str, parse_mode: str = "Markdown") -> bool:
+    """
+    Synchronous send. Used internally by the _sync notify functions (which
+    run on background threads) and by test_connection() (which is a manual
+    diagnostic call, not part of the webhook request path, so blocking here
+    is fine and preferable).
+    """
     bot = _get_bot()
     if not bot:
         return False
@@ -71,9 +88,22 @@ def _send_via_requests(text: str) -> bool:
         return False
 
 
+# ---------------------------------------------------------------------------
+# Public notify_* functions — these are the ones called from app.py.
+# Each one only dispatches to a background thread and returns immediately.
+# The actual message-building + send_message() logic lives in the paired
+# _sync function below it.
+# ---------------------------------------------------------------------------
+
 def notify_trade_open(symbol: str, action: str, entry: float,
                       qty: int, sl: float = None, tp: float = None,
                       pos_id: str = None, charges: float = 0.0):
+    _send_async(_notify_trade_open_sync, symbol, action, entry, qty, sl, tp, pos_id, charges)
+
+
+def _notify_trade_open_sync(symbol: str, action: str, entry: float,
+                            qty: int, sl: float = None, tp: float = None,
+                            pos_id: str = None, charges: float = 0.0):
     sl_str = f"Rs.{sl:,.2f}" if sl else "Not set"
     tp_str = f"Rs.{tp:,.2f}" if tp else "Not set"
     icon = "POSITION OPENED (LONG)" if action.upper() in ("BUY", "LONG") else "POSITION OPENED (SHORT)"
@@ -95,6 +125,12 @@ def notify_trade_open(symbol: str, action: str, entry: float,
 def notify_trade_close(symbol: str, action: str, entry: float,
                        exit_price: float, qty: int, pnl: float,
                        reason: str, charges: float = 0.0):
+    _send_async(_notify_trade_close_sync, symbol, action, entry, exit_price, qty, pnl, reason, charges)
+
+
+def _notify_trade_close_sync(symbol: str, action: str, entry: float,
+                             exit_price: float, qty: int, pnl: float,
+                             reason: str, charges: float = 0.0):
     net_pnl = pnl - charges
     icon = "POSITION CLOSED - PROFIT" if net_pnl >= 0 else "POSITION CLOSED - LOSS"
     sign = "+" if net_pnl >= 0 else ""
@@ -115,6 +151,10 @@ def notify_trade_close(symbol: str, action: str, entry: float,
 
 
 def notify_circuit_breaker(reason: str):
+    _send_async(_notify_circuit_breaker_sync, reason)
+
+
+def _notify_circuit_breaker_sync(reason: str):
     msg = (
         f"*CIRCUIT BREAKER TRIGGERED*\n"
         f"---------------------\n"
@@ -127,6 +167,11 @@ def notify_circuit_breaker(reason: str):
 
 def notify_daily_summary(capital: float, daily_pnl: float,
                           trades: int, wins: int, losses: int):
+    _send_async(_notify_daily_summary_sync, capital, daily_pnl, trades, wins, losses)
+
+
+def _notify_daily_summary_sync(capital: float, daily_pnl: float,
+                               trades: int, wins: int, losses: int):
     sign = "+" if daily_pnl >= 0 else ""
     rate = round(wins / trades * 100, 1) if trades > 0 else 0
     msg = (
@@ -136,12 +181,16 @@ def notify_daily_summary(capital: float, daily_pnl: float,
         f"Day P&L:  `{sign}Rs.{daily_pnl:,.2f}`\n"
         f"Trades:   `{trades}` (W:{wins} L:{losses})\n"
         f"Win Rate: `{rate}%`\n"
-        f"Date:     `{datetime.now().strftime(chr(37)+chr(100)+chr(45)+chr(37)+chr(98)+chr(45)+chr(37)+chr(89))}`"
+        f"Date:     `{datetime.now().strftime('%d-%b-%Y')}`"
     )
     send_message(msg)
 
 
 def notify_startup(capital: float, mode: str = "PAPER"):
+    _send_async(_notify_startup_sync, capital, mode)
+
+
+def _notify_startup_sync(capital: float, mode: str = "PAPER"):
     msg = (
         f"*TRADING BOT STARTED*\n"
         f"---------------------\n"
@@ -152,6 +201,12 @@ def notify_startup(capital: float, mode: str = "PAPER"):
     )
     send_message(msg)
 
+
+# ---------------------------------------------------------------------------
+# Diagnostic functions — intentionally left SYNCHRONOUS.
+# These are called manually (not from the webhook request path), so blocking
+# here is fine and actually desirable: you want the real result immediately.
+# ---------------------------------------------------------------------------
 
 def test_connection() -> dict:
     bot = _get_bot()
@@ -183,3 +238,4 @@ def get_status() -> dict:
 
 def _now() -> str:
     return datetime.now().strftime("%d-%m-%Y %H:%M:%S")
+    
