@@ -88,6 +88,46 @@ def _send_via_requests(text: str) -> bool:
         return False
 
 
+def send_document(file_bytes: bytes, filename: str, caption: str = "") -> bool:
+    """
+    Send an in-memory file (bytes) to Telegram as a document attachment.
+    No disk write required - safe to call even on ephemeral storage.
+
+    Synchronous by design: intended for scheduled jobs (e.g. the daily
+    snapshot job in app.py), not the webhook request path, so blocking
+    here is fine and lets the caller know immediately if it failed.
+    """
+    bot = _get_bot()
+    if not bot:
+        return _send_document_via_requests(file_bytes, filename, caption)
+    try:
+        import io
+        bot.send_document(
+            TELEGRAM_CHAT_ID,
+            (filename, io.BytesIO(file_bytes)),
+            caption=caption
+        )
+        return True
+    except Exception as e:
+        logger.error(f"Telegram send_document failed: {e}")
+        return _send_document_via_requests(file_bytes, filename, caption)
+
+
+def _send_document_via_requests(file_bytes: bytes, filename: str, caption: str = "") -> bool:
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
+        resp = requests.post(
+            url,
+            data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption},
+            files={"document": (filename, file_bytes)},
+            timeout=TELEGRAM_TIMEOUT
+        )
+        return resp.status_code == 200
+    except Exception as e:
+        logger.error(f"Telegram send_document fallback failed: {e}")
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Public notify_* functions — these are the ones called from app.py.
 # Each one only dispatches to a background thread and returns immediately.
