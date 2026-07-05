@@ -653,9 +653,12 @@ def _handle_open(payload: dict, action: str, symbol: str):
         confluence_score=confluence
     )
 
-    account = db.get_account(TRADING_MODE)
-    db.update_account(TRADING_MODE, current_capital=round(account["current_capital"] - charges, 2))
-
+    # NOTE: current_capital is intentionally NOT reduced here. It represents
+    # realized cash and is only adjusted once, at close, via
+    # portfolio.apply_trade_close() (which already nets out entry+exit
+    # charges). Reducing it here too caused entry charges to be double
+    # counted on every closed trade. "Locked" capital for open positions is
+    # shown separately by PortfolioManager.get_summary().
     notify_trade_open(symbol, action, entry, qty, sl, tp, pos_id, charges)
     logger.info(f"Position opened: {action} {symbol} @ Rs.{entry} qty={qty}")
 
@@ -725,10 +728,14 @@ def _handle_open_option(payload: dict, symbol: str):
         entry_charges=charges
     )
 
-    account = db.get_account(TRADING_MODE)
-    cost    = premium * qty + charges
-    db.update_account(TRADING_MODE, current_capital=round(account["current_capital"] - cost, 2))
-
+    # NOTE: current_capital is intentionally NOT reduced here. Previously
+    # this deducted the full premium*qty notional at open, and
+    # apply_trade_close() only added back the net P&L at close (not the
+    # exit proceeds) — so the entire premium notional was effectively lost
+    # from current_capital on every options round trip, even breakeven
+    # ones. Capital is now only touched once, at close, via
+    # apply_trade_close(). "Locked" premium for open positions is shown
+    # separately by PortfolioManager.get_summary().
     notify_trade_open(option_symbol, f"BUY {option_type}", premium, qty, sl, tp, pos_id, charges)
     logger.info(f"Option opened: {option_symbol} @ Rs.{premium} qty={qty}")
 
@@ -943,4 +950,5 @@ if __name__ == "__main__":
     logger.info("=" * 60)
     notify_startup(INITIAL_CAPITAL, TRADING_MODE)
     app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
+
     

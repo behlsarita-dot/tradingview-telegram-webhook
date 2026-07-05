@@ -53,6 +53,7 @@ class DatabaseManager:
                     losing_trades INTEGER NOT NULL DEFAULT 0,
                     trading_enabled INTEGER NOT NULL DEFAULT 1,
                     kill_switch_reason TEXT,
+                    peak_capital REAL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 )
@@ -141,6 +142,8 @@ class DatabaseManager:
                 c.execute("ALTER TABLE account ADD COLUMN trading_enabled INTEGER DEFAULT 1")
             if "kill_switch_reason" not in cols:
                 c.execute("ALTER TABLE account ADD COLUMN kill_switch_reason TEXT")
+            if "peak_capital" not in cols:
+                c.execute("ALTER TABLE account ADD COLUMN peak_capital REAL")
 
             c.execute("SELECT COUNT(*) as cnt FROM account WHERE mode='PAPER'")
             if c.fetchone()["cnt"] == 0:
@@ -150,10 +153,20 @@ class DatabaseManager:
                         (mode, initial_capital, current_capital, total_pnl,
                          daily_pnl, open_positions, total_trades,
                          winning_trades, losing_trades, trading_enabled,
-                         created_at, updated_at)
-                    VALUES (?, ?, ?, 0, 0, 0, 0, 0, 0, 1, ?, ?)
-                """, ("PAPER", INITIAL_CAPITAL, INITIAL_CAPITAL, now, now))
+                         peak_capital, created_at, updated_at)
+                    VALUES (?, ?, ?, 0, 0, 0, 0, 0, 0, 1, ?, ?, ?)
+                """, ("PAPER", INITIAL_CAPITAL, INITIAL_CAPITAL, INITIAL_CAPITAL, now, now))
                 logger.info(f"Paper account initialised with Rs.{INITIAL_CAPITAL:,.2f}")
+
+            # Backfill peak_capital for existing rows created before this
+            # column existed (or where it's still null) — start it at
+            # whichever is larger of current_capital or initial_capital so
+            # we never silently understate an already-elevated peak.
+            c.execute("""
+                UPDATE account
+                SET peak_capital = MAX(current_capital, initial_capital)
+                WHERE peak_capital IS NULL
+            """)
 
         logger.info("Database initialised")
 
@@ -188,6 +201,25 @@ class DatabaseManager:
             c.execute(
                 "UPDATE account SET trading_enabled=?, kill_switch_reason=?, updated_at=? WHERE mode=?",
                 (1 if enabled else 0, reason, datetime.now().isoformat(), mode)
+            )
+
+    def get_peak_capital(self, mode: str = "PAPER") -> float:
+        """Persisted high-water mark for capital, used for drawdown/circuit
+        breaker calculations. Survives restarts (unlike an in-memory
+        attribute), so a dip after a restart is measured against the real
+        historical peak, not against INITIAL_CAPITAL."""
+        with self.get_cursor() as c:
+            c.execute("SELECT peak_capital, initial_capital FROM account WHERE mode=?", (mode,))
+            row = c.fetchone()
+            if not row:
+                return 0.0
+            return row["peak_capital"] if row["peak_capital"] is not None else row["initial_capital"]
+
+    def update_peak_capital(self, peak: float, mode: str = "PAPER"):
+        with self.get_cursor() as c:
+            c.execute(
+                "UPDATE account SET peak_capital=?, updated_at=? WHERE mode=?",
+                (peak, datetime.now().isoformat(), mode)
             )
 
     # ------------------------------------------------------------------ #
@@ -435,3 +467,5 @@ class DatabaseManager:
                 )
             """, (mode, today, mode, today))
             return c.fetchone()["cnt"] or 0
+
+            

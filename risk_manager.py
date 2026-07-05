@@ -24,7 +24,6 @@ class RiskManager:
     def __init__(self, db, initial_capital: float = INITIAL_CAPITAL):
         self.db = db
         self.initial_capital = initial_capital
-        self.peak_capital = initial_capital
         logger.info("Risk Manager initialised")
 
     def validate_new_trade(self, symbol: str, entry: float,
@@ -80,7 +79,7 @@ class RiskManager:
 
     def _check_circuit_breakers(self, account: Dict, mode: str) -> Tuple[bool, str]:
         capital = account["current_capital"]
-        drawdown = self._calculate_drawdown(capital)
+        drawdown = self._calculate_drawdown(capital, mode)
 
         if drawdown >= MAX_DRAWDOWN_PCT:
             return False, f"Max drawdown {drawdown:.1f}% exceeded ({MAX_DRAWDOWN_PCT}%)"
@@ -95,12 +94,20 @@ class RiskManager:
 
         return True, ""
 
-    def _calculate_drawdown(self, current_capital: float) -> float:
-        if current_capital > self.peak_capital:
-            self.peak_capital = current_capital
-        if self.peak_capital == 0:
+    def _calculate_drawdown(self, current_capital: float, mode: str = "PAPER") -> float:
+        """Drawdown vs. a peak-capital high-water mark persisted in the
+        account table. Previously peak_capital lived only as an in-memory
+        attribute on this instance, so every process restart (which happens
+        often on Render with the current SQLite-in-/tmp setup) silently
+        reset it back to INITIAL_CAPITAL — understating real drawdown and
+        weakening the circuit breaker right when it mattered most."""
+        peak = self.db.get_peak_capital(mode)
+        if current_capital > peak:
+            peak = current_capital
+            self.db.update_peak_capital(peak, mode)
+        if peak == 0:
             return 0.0
-        return ((self.peak_capital - current_capital) / self.peak_capital) * 100
+        return ((peak - current_capital) / peak) * 100
 
     def _calculate_portfolio_heat(self, open_positions: list,
                                    capital: float) -> float:
@@ -124,7 +131,7 @@ class RiskManager:
             return LOT_SIZE
 
         capital = account["current_capital"]
-        multiplier = self._size_multiplier(capital)
+        multiplier = self._size_multiplier(capital, mode)
         risk_amt = capital * (RISK_PER_TRADE_PERCENT / 100) * multiplier
 
         risk_per_unit = abs(entry - sl) if sl and entry else entry * 0.005
@@ -141,8 +148,8 @@ class RiskManager:
         lots = max(1, round(size / LOT_SIZE))
         return lots * LOT_SIZE
 
-    def _size_multiplier(self, capital: float) -> float:
-        drawdown = self._calculate_drawdown(capital)
+    def _size_multiplier(self, capital: float, mode: str = "PAPER") -> float:
+        drawdown = self._calculate_drawdown(capital, mode)
         if drawdown < DRAWDOWN_REDUCTION_START:
             return 1.0
         if drawdown >= MAX_DRAWDOWN_PCT:
@@ -175,12 +182,12 @@ class RiskManager:
             return {"can_trade": False, "error": "Account not found"}
 
         capital = account["current_capital"]
-        drawdown = self._calculate_drawdown(capital)
+        drawdown = self._calculate_drawdown(capital, mode)
         daily_pnl = self.db.get_daily_pnl(mode)
         consec = self.db.get_consecutive_losses(mode)
         open_pos = self.db.get_open_positions(mode)
         heat = self._calculate_portfolio_heat(open_pos, capital)
-        multiplier = self._size_multiplier(capital)
+        multiplier = self._size_multiplier(capital, mode)
         trading_enabled = self.db.is_trading_enabled(mode)
 
         can_trade, cb_reason = self._check_circuit_breakers(account, mode)
@@ -197,7 +204,7 @@ class RiskManager:
             "circuit_breaker_reason": cb_reason if not can_trade else None,
             "current_drawdown": round(drawdown, 2),
             "max_drawdown": MAX_DRAWDOWN_PCT,
-            "peak_capital": round(self.peak_capital, 2),
+            "peak_capital": round(self.db.get_peak_capital(mode), 2),
             "current_capital": round(capital, 2),
             "portfolio_heat": round(heat, 2),
             "consecutive_losses": consec,
@@ -235,3 +242,5 @@ class RiskManager:
 
 def create_risk_manager(db, initial_capital: float = INITIAL_CAPITAL) -> RiskManager:
     return RiskManager(db, initial_capital)
+
+    
