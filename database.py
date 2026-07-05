@@ -1,945 +1,437 @@
 ﻿#!/usr/bin/env python3
 """
-Paper Trading System v7.0 - Main Flask Application
-Features:
-- EOD auto-close at 15:20 IST (intraday enforcement)
-- Block new entries after 15:00 IST
-- Re-enable trading at 09:10 IST
-- Kill switch (manual halt/resume)
-- Emergency close all positions
-- Per-position close via dashboard
+Database Manager - Paper Trading System v7.0
 """
 
-import os
+import sqlite3
 import logging
-import time
+import uuid
+from contextlib import contextmanager
 from datetime import datetime
+from typing import Optional, List, Dict
 
-from flask import Flask, request, jsonify, render_template
-from flask_cors import CORS
+from config import DB_FILE, INITIAL_CAPITAL, TRADING_MODE
 
-import pytz
-from config import LOG_LEVEL, LOG_FILE, TRADING_MODE, INITIAL_CAPITAL, WEBHOOK_SECRET
-
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_FILE, encoding="utf-8"),
-        logging.StreamHandler()
-    ]
-)
 logger = logging.getLogger(__name__)
 
-from config import (
-    SECRET_KEY, FLASK_DEBUG, PORT, WEBHOOK_MAX_AGE_SECONDS,
-    LOT_SIZE, ENABLE_RISK_MANAGEMENT, TELEGRAM_ENABLED, init_redis
-)
-from exceptions import (
-    handle_exception, InvalidWebhookSecretError,
-    PositionNotFoundError, ValidationError, InvalidActionError
-)
-from database import DatabaseManager
-from risk_manager import create_risk_manager
-from portfolio import (
-    PortfolioManager, calculate_option_charges,
-    calculate_equity_charges, calculate_pnl
-)
-from telegram_notifier import (
-    notify_trade_open, notify_trade_close,
-    notify_circuit_breaker, notify_startup,
-    test_connection, get_status as tg_status, send_message
-)
 
-try:
-    from enhanced_strategy import create_strategy_engine
-    strategy_engine = create_strategy_engine()
-    STRATEGY_AVAILABLE = True
-except Exception as e:
-    logger.warning(f"Enhanced strategy not available: {e}")
-    strategy_engine = None
-    STRATEGY_AVAILABLE = False
+class DatabaseManager:
+    def __init__(self, db_file: str = DB_FILE):
+        self.db_file = db_file
+        self._init_db()
 
-try:
-    from backtester import create_backtester
-    backtester = create_backtester()
-    BACKTESTING_AVAILABLE = True
-except Exception as e:
-    logger.warning(f"Backtester not available: {e}")
-    backtester = None
-    BACKTESTING_AVAILABLE = False
+    @contextmanager
+    def get_cursor(self):
+        conn = sqlite3.connect(self.db_file, timeout=30, check_same_thread=False)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=30000")
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        try:
+            yield cursor
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            raise e
+        finally:
+            cursor.close()
+            conn.close()
 
-app = Flask(__name__)
-app.secret_key = SECRET_KEY
-CORS(app)
-
-db = DatabaseManager()
-risk_mgr = create_risk_manager(db, INITIAL_CAPITAL)
-portfolio = PortfolioManager(db)
-redis = init_redis()
-START_TIME = time.time()
-
-IST = pytz.timezone("Asia/Kolkata")
-
-VALID_ACTIONS = {
-    "BUY", "SELL", "LONG", "SHORT",
-    "EXIT", "EXIT_LONG", "EXIT_SHORT",
-    "BUY_OPTION", "EXIT_OPTION"
-}
-
-logger.info(f"Paper Trading System v7.0 starting - mode={TRADING_MODE}")
-
-
-def ist_now() -> str:
-    return datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
-
-
-def normalise_action(action: str) -> str:
-    a = action.upper().strip()
-    if a == "LONG":
-        return "BUY"
-    if a == "SHORT":
-        return "SELL"
-    return a
-
-
-def verify_webhook_secret(payload: dict):
-    secret = payload.get("webhook_secret", "")
-    if secret != WEBHOOK_SECRET:
-        raise InvalidWebhookSecretError()
-
-
-def rate_limit(key: str, limit: int = 30, window: int = 60) -> bool:
-    rkey = f"rl:{key}"
-    try:
-        count = redis.incr(rkey)
-        if count == 1:
-            redis.expire(rkey, window)
-        return count <= limit
-    except Exception:
-        return True
-
-
-# ── Price Fetcher ──────────────────────────────────────────────────────────
-
-def _get_nifty_price() -> tuple:
-    """
-    Get current NIFTY price.
-    Returns (price, is_live) — is_live=False means price is estimated.
-    """
-    try:
-        import yfinance as yf
-        ticker = yf.Ticker("^NSEI")
-        data = ticker.history(period="1d", interval="1m")
-        if not data.empty:
-            price = round(float(data["Close"].iloc[-1]), 2)
-            return price, True
-    except Exception as e:
-        logger.warning(f"yfinance NIFTY fetch failed: {e}")
-
-    # Fallback 1: use last known price from open positions
-    try:
-        positions = db.get_open_positions(TRADING_MODE)
-        if positions:
-            price = float(positions[0].get("current_price") or positions[0]["entry_price"])
-            logger.warning(f"Using entry price as fallback: {price}")
-            return price, False
-    except Exception:
-        pass
-
-    # Fallback 2: hardcoded — flagged clearly
-    logger.warning("Using hardcoded NIFTY fallback price 24400 — P&L will be approximate")
-    return 24400.0, False
-
-
-def _get_option_price(pos: dict) -> tuple:
-    """
-    Get current option price.
-    Returns (price, is_live).
-    """
-    try:
-        import yfinance as yf
-        symbol = pos.get("option_symbol", "")
-        if symbol:
-            ticker = yf.Ticker(f"{symbol}.NS")
-            data = ticker.history(period="1d", interval="1m")
-            if not data.empty:
-                price = round(float(data["Close"].iloc[-1]), 2)
-                return price, True
-    except Exception as e:
-        logger.warning(f"yfinance option fetch failed: {e}")
-
-    # Fallback: entry premium (flat exit)
-    entry_premium = pos.get("premium", 0)
-    logger.warning(f"Using entry premium as option fallback: {entry_premium}")
-    return entry_premium, False
-
-
-# ── EOD Auto-Close ─────────────────────────────────────────────────────────
-
-def close_all_positions_eod(reason: str = "EOD Auto-Close 15:20"):
-    """
-    Close all open positions.
-    Used by scheduler at 15:20 and by emergency-close route.
-    Flags estimated prices clearly in exit_reason.
-    """
-    logger.info(f"Close all triggered: {reason}")
-
-    try:
-        close_price, price_live = _get_nifty_price()
-        price_flag = "" if price_live else " [ESTIMATED PRICE]"
-
-        open_positions = db.get_open_positions(TRADING_MODE)
-        open_options   = db.get_open_option_positions(TRADING_MODE)
-        total          = len(open_positions) + len(open_options)
-
-        if total == 0:
-            logger.info("Close all: no open positions to close")
-            send_message(f"*{reason}*\nNo open positions found.")
-            return 0
-
-        send_message(
-            f"*{reason}*\n"
-            f"Closing {total} position(s)\n"
-            f"NIFTY: Rs.{close_price:,.2f}{price_flag}\n"
-            f"Time: `{ist_now()}`"
-        )
-
-        closed = 0
-
-        # Close equity/futures positions
-        for pos in open_positions:
-            try:
-                exit_reason = f"{reason}{price_flag}"
-                result = portfolio.apply_trade_close(
-                    pos, close_price, exit_reason, TRADING_MODE
+    def _init_db(self):
+        with self.get_cursor() as c:
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS account (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    mode TEXT NOT NULL DEFAULT 'PAPER',
+                    initial_capital REAL NOT NULL,
+                    current_capital REAL NOT NULL,
+                    total_pnl REAL NOT NULL DEFAULT 0.0,
+                    daily_pnl REAL NOT NULL DEFAULT 0.0,
+                    open_positions INTEGER NOT NULL DEFAULT 0,
+                    total_trades INTEGER NOT NULL DEFAULT 0,
+                    winning_trades INTEGER NOT NULL DEFAULT 0,
+                    losing_trades INTEGER NOT NULL DEFAULT 0,
+                    trading_enabled INTEGER NOT NULL DEFAULT 1,
+                    kill_switch_reason TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
                 )
-                notify_trade_close(
-                    pos["symbol"], pos["action"],
-                    pos["entry_price"], close_price,
-                    pos["quantity"], result["gross_pnl"],
-                    exit_reason, result["total_charges"]
+            """)
+
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS positions (
+                    id TEXT PRIMARY KEY,
+                    mode TEXT NOT NULL DEFAULT 'PAPER',
+                    symbol TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    entry_price REAL NOT NULL,
+                    exit_price REAL,
+                    quantity INTEGER NOT NULL,
+                    stop_loss REAL,
+                    take_profit REAL,
+                    current_price REAL,
+                    unrealized_pnl REAL DEFAULT 0.0,
+                    pnl REAL,
+                    entry_charges REAL DEFAULT 0.0,
+                    exit_charges REAL DEFAULT 0.0,
+                    total_charges REAL DEFAULT 0.0,
+                    status TEXT NOT NULL DEFAULT 'OPEN',
+                    exit_reason TEXT,
+                    entry_time TEXT NOT NULL,
+                    exit_time TEXT,
+                    atr REAL,
+                    adx REAL,
+                    confluence_score INTEGER DEFAULT 0
                 )
-                logger.info(
-                    f"Closed: {pos['action']} {pos['symbol']} "
-                    f"@ Rs.{close_price:,.2f} pnl=Rs.{result['net_pnl']:,.2f}{price_flag}"
+            """)
+
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS option_positions (
+                    id TEXT PRIMARY KEY,
+                    mode TEXT NOT NULL DEFAULT 'PAPER',
+                    underlying TEXT NOT NULL,
+                    option_symbol TEXT NOT NULL,
+                    option_type TEXT NOT NULL,
+                    strike REAL NOT NULL,
+                    expiry TEXT NOT NULL,
+                    premium REAL NOT NULL,
+                    exit_premium REAL,
+                    quantity INTEGER NOT NULL,
+                    stop_loss REAL,
+                    take_profit REAL,
+                    pnl REAL,
+                    entry_charges REAL DEFAULT 0.0,
+                    exit_charges REAL DEFAULT 0.0,
+                    total_charges REAL DEFAULT 0.0,
+                    status TEXT NOT NULL DEFAULT 'OPEN',
+                    exit_reason TEXT,
+                    entry_time TEXT NOT NULL,
+                    exit_time TEXT
                 )
-                closed += 1
-            except Exception as e:
-                logger.error(f"Close failed for position {pos['id']}: {e}")
+            """)
 
-        # Close option positions
-        for pos in open_options:
-            try:
-                opt_price, opt_live = _get_option_price(pos)
-                opt_flag = "" if opt_live else " [ESTIMATED PRICE]"
-                exit_reason = f"{reason}{opt_flag}"
-
-                result = portfolio.apply_trade_close(
-                    pos, opt_price, exit_reason, TRADING_MODE
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS risk_metrics (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    mode TEXT NOT NULL DEFAULT 'PAPER',
+                    timestamp TEXT NOT NULL,
+                    drawdown_pct REAL DEFAULT 0.0,
+                    portfolio_heat_pct REAL DEFAULT 0.0,
+                    consecutive_losses INTEGER DEFAULT 0,
+                    daily_pnl REAL DEFAULT 0.0,
+                    var_95 REAL DEFAULT 0.0
                 )
-                notify_trade_close(
-                    pos["option_symbol"], "SELL",
-                    pos["premium"], opt_price,
-                    pos["quantity"], result["gross_pnl"],
-                    exit_reason, result["total_charges"]
+            """)
+
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS circuit_breakers (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    mode TEXT NOT NULL DEFAULT 'PAPER',
+                    reason TEXT NOT NULL,
+                    triggered_at TEXT NOT NULL,
+                    reset_at TEXT,
+                    active INTEGER NOT NULL DEFAULT 1
                 )
-                logger.info(
-                    f"Closed option: {pos['option_symbol']} "
-                    f"@ Rs.{opt_price:,.2f} pnl=Rs.{result['net_pnl']:,.2f}{opt_flag}"
+            """)
+
+            # Add kill switch columns to existing DB if missing
+            c.execute("PRAGMA table_info(account)")
+            cols = [r["name"] for r in c.fetchall()]
+            if "trading_enabled" not in cols:
+                c.execute("ALTER TABLE account ADD COLUMN trading_enabled INTEGER DEFAULT 1")
+            if "kill_switch_reason" not in cols:
+                c.execute("ALTER TABLE account ADD COLUMN kill_switch_reason TEXT")
+
+            c.execute("SELECT COUNT(*) as cnt FROM account WHERE mode='PAPER'")
+            if c.fetchone()["cnt"] == 0:
+                now = datetime.now().isoformat()
+                c.execute("""
+                    INSERT INTO account
+                        (mode, initial_capital, current_capital, total_pnl,
+                         daily_pnl, open_positions, total_trades,
+                         winning_trades, losing_trades, trading_enabled,
+                         created_at, updated_at)
+                    VALUES (?, ?, ?, 0, 0, 0, 0, 0, 0, 1, ?, ?)
+                """, ("PAPER", INITIAL_CAPITAL, INITIAL_CAPITAL, now, now))
+                logger.info(f"Paper account initialised with Rs.{INITIAL_CAPITAL:,.2f}")
+
+        logger.info("Database initialised")
+
+    # ------------------------------------------------------------------ #
+    # ACCOUNT
+    # ------------------------------------------------------------------ #
+
+    def get_account(self, mode: str = "PAPER") -> Optional[Dict]:
+        with self.get_cursor() as c:
+            c.execute("SELECT * FROM account WHERE mode=?", (mode,))
+            row = c.fetchone()
+            return dict(row) if row else None
+
+    def update_account(self, mode: str = "PAPER", **kwargs):
+        if not kwargs:
+            return
+        fields = ", ".join(f"{k}=?" for k in kwargs)
+        kwargs["updated_at"] = datetime.now().isoformat()
+        fields += ", updated_at=?"
+        values = list(kwargs.values())
+        with self.get_cursor() as c:
+            c.execute(f"UPDATE account SET {fields} WHERE mode=?", values + [mode])
+
+    def is_trading_enabled(self, mode: str = "PAPER") -> bool:
+        with self.get_cursor() as c:
+            c.execute("SELECT trading_enabled FROM account WHERE mode=?", (mode,))
+            row = c.fetchone()
+            return bool(row["trading_enabled"]) if row and row["trading_enabled"] is not None else True
+
+    def set_trading_enabled(self, enabled: bool, mode: str = "PAPER", reason: str = ""):
+        with self.get_cursor() as c:
+            c.execute(
+                "UPDATE account SET trading_enabled=?, kill_switch_reason=?, updated_at=? WHERE mode=?",
+                (1 if enabled else 0, reason, datetime.now().isoformat(), mode)
+            )
+
+    # ------------------------------------------------------------------ #
+    # POSITIONS
+    # ------------------------------------------------------------------ #
+
+    def open_position(self, mode: str, symbol: str, action: str,
+                      entry_price: float, quantity: int,
+                      stop_loss: float = None, take_profit: float = None,
+                      entry_charges: float = 0.0, atr: float = None,
+                      adx: float = None, confluence_score: int = 0) -> str:
+        pos_id = str(uuid.uuid4())
+        now = datetime.now().isoformat()
+        with self.get_cursor() as c:
+            c.execute("""
+                INSERT INTO positions
+                    (id, mode, symbol, action, entry_price, quantity,
+                     stop_loss, take_profit, entry_charges, status,
+                     entry_time, atr, adx, confluence_score)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?, ?, ?)
+            """, (pos_id, mode, symbol, action, entry_price, quantity,
+                  stop_loss, take_profit, entry_charges, now,
+                  atr, adx, confluence_score))
+        return pos_id
+
+    def close_position(self, pos_id: str, exit_price: float,
+                       exit_reason: str, pnl: float,
+                       exit_charges: float = 0.0):
+        now = datetime.now().isoformat()
+        with self.get_cursor() as c:
+            c.execute("""
+                UPDATE positions
+                SET status='CLOSED', exit_price=?, exit_time=?,
+                    exit_reason=?, pnl=?, exit_charges=?,
+                    total_charges=entry_charges+?
+                WHERE id=?
+            """, (exit_price, now, exit_reason, pnl,
+                  exit_charges, exit_charges, pos_id))
+
+    def get_open_positions(self, mode: str = "PAPER") -> List[Dict]:
+        with self.get_cursor() as c:
+            c.execute("""
+                SELECT * FROM positions
+                WHERE mode=? AND status='OPEN'
+                ORDER BY entry_time DESC
+            """, (mode,))
+            return [dict(r) for r in c.fetchall()]
+
+    def get_position_by_id(self, pos_id: str) -> Optional[Dict]:
+        with self.get_cursor() as c:
+            c.execute("SELECT * FROM positions WHERE id=?", (pos_id,))
+            row = c.fetchone()
+            return dict(row) if row else None
+
+    def get_open_position_by_symbol(self, symbol: str, mode: str = "PAPER") -> Optional[Dict]:
+        with self.get_cursor() as c:
+            c.execute("""
+                SELECT * FROM positions
+                WHERE symbol=? AND mode=? AND status='OPEN'
+                ORDER BY entry_time DESC LIMIT 1
+            """, (symbol, mode))
+            row = c.fetchone()
+            return dict(row) if row else None
+
+    def get_all_positions(self, mode: str = "PAPER",
+                          status: str = None, limit: int = 50) -> List[Dict]:
+        with self.get_cursor() as c:
+            if status:
+                c.execute("""
+                    SELECT * FROM positions
+                    WHERE mode=? AND status=?
+                    ORDER BY entry_time DESC LIMIT ?
+                """, (mode, status.upper(), limit))
+            else:
+                c.execute("""
+                    SELECT * FROM positions
+                    WHERE mode=?
+                    ORDER BY entry_time DESC LIMIT ?
+                """, (mode, limit))
+            return [dict(r) for r in c.fetchall()]
+
+    def update_position_price(self, pos_id: str,
+                              current_price: float, unrealized_pnl: float):
+        with self.get_cursor() as c:
+            c.execute("""
+                UPDATE positions
+                SET current_price=?, unrealized_pnl=?
+                WHERE id=?
+            """, (current_price, unrealized_pnl, pos_id))
+
+    # ------------------------------------------------------------------ #
+    # OPTIONS
+    # ------------------------------------------------------------------ #
+
+    def open_option_position(self, mode: str, underlying: str,
+                             option_symbol: str, option_type: str,
+                             strike: float, expiry: str, premium: float,
+                             quantity: int, stop_loss: float = None,
+                             take_profit: float = None,
+                             entry_charges: float = 0.0) -> str:
+        pos_id = str(uuid.uuid4())
+        now = datetime.now().isoformat()
+        with self.get_cursor() as c:
+            c.execute("""
+                INSERT INTO option_positions
+                    (id, mode, underlying, option_symbol, option_type,
+                     strike, expiry, premium, quantity, stop_loss,
+                     take_profit, entry_charges, status, entry_time)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?)
+            """, (pos_id, mode, underlying, option_symbol, option_type,
+                  strike, expiry, premium, quantity, stop_loss,
+                  take_profit, entry_charges, now))
+        return pos_id
+
+    def close_option_position(self, pos_id: str, exit_premium: float,
+                              exit_reason: str, pnl: float,
+                              exit_charges: float = 0.0):
+        now = datetime.now().isoformat()
+        with self.get_cursor() as c:
+            c.execute("""
+                UPDATE option_positions
+                SET status='CLOSED', exit_premium=?, exit_time=?,
+                    exit_reason=?, pnl=?, exit_charges=?,
+                    total_charges=entry_charges+?
+                WHERE id=?
+            """, (exit_premium, now, exit_reason, pnl,
+                  exit_charges, exit_charges, pos_id))
+
+    def get_open_option_positions(self, mode: str = "PAPER") -> List[Dict]:
+        with self.get_cursor() as c:
+            c.execute("""
+                SELECT * FROM option_positions
+                WHERE mode=? AND status='OPEN'
+                ORDER BY entry_time DESC
+            """, (mode,))
+            return [dict(r) for r in c.fetchall()]
+
+    def get_open_option_by_symbol(self, option_symbol: str,
+                                  mode: str = "PAPER") -> Optional[Dict]:
+        with self.get_cursor() as c:
+            c.execute("""
+                SELECT * FROM option_positions
+                WHERE option_symbol=? AND mode=? AND status='OPEN'
+                ORDER BY entry_time DESC LIMIT 1
+            """, (option_symbol, mode))
+            row = c.fetchone()
+            return dict(row) if row else None
+
+    def get_all_option_positions(self, mode: str = "PAPER",
+                                 status: str = None, limit: int = 50) -> List[Dict]:
+        """Lists option trades (open, closed, or both). Fixes BOT-05:
+        previously there was no way to see closed option trade history at all."""
+        with self.get_cursor() as c:
+            if status:
+                c.execute("""
+                    SELECT * FROM option_positions
+                    WHERE mode=? AND status=?
+                    ORDER BY entry_time DESC LIMIT ?
+                """, (mode, status.upper(), limit))
+            else:
+                c.execute("""
+                    SELECT * FROM option_positions
+                    WHERE mode=?
+                    ORDER BY entry_time DESC LIMIT ?
+                """, (mode, limit))
+            return [dict(r) for r in c.fetchall()]
+
+    # ------------------------------------------------------------------ #
+    # STATISTICS
+    # ------------------------------------------------------------------ #
+
+    def get_trade_stats(self, mode: str = "PAPER") -> Dict:
+        """Unions positions + option_positions so win_rate/profit_factor/
+        best_trade/worst_trade reflect option trades too, instead of
+        always showing zero for an options-only strategy."""
+        with self.get_cursor() as c:
+            c.execute("""
+                SELECT
+                    COUNT(*) as total_trades,
+                    SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins,
+                    SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END) as losses,
+                    SUM(CASE WHEN pnl = 0 THEN 1 ELSE 0 END) as breakeven,
+                    COALESCE(SUM(pnl), 0) as total_pnl,
+                    COALESCE(AVG(CASE WHEN pnl > 0 THEN pnl END), 0) as avg_win,
+                    COALESCE(AVG(CASE WHEN pnl < 0 THEN pnl END), 0) as avg_loss,
+                    COALESCE(MAX(pnl), 0) as best_trade,
+                    COALESCE(MIN(pnl), 0) as worst_trade,
+                    COALESCE(SUM(total_charges), 0) as total_charges
+                FROM (
+                    SELECT pnl, total_charges FROM positions WHERE mode=? AND status='CLOSED'
+                    UNION ALL
+                    SELECT pnl, total_charges FROM option_positions WHERE mode=? AND status='CLOSED'
                 )
-                closed += 1
-            except Exception as e:
-                logger.error(f"Close failed for option {pos['id']}: {e}")
-
-        # Summary
-        account   = db.get_account(TRADING_MODE)
-        daily_pnl = db.get_daily_pnl(TRADING_MODE)
-        send_message(
-            f"*CLOSE COMPLETE*\n"
-            f"Closed: {closed}/{total} position(s)\n"
-            f"Capital: Rs.{account['current_capital']:,.2f}\n"
-            f"Today P&L: Rs.{daily_pnl:+,.2f}\n"
-            f"{price_flag if not price_live else ''}"
-        )
-        return closed
-
-    except Exception as e:
-        logger.error(f"Close all error: {e}")
-        send_message(f"*CLOSE ALL ERROR*\n{str(e)}")
-        return 0
-
-
-# ── Scheduler ─────────────────────────────────────────────────────────────
-
-def _eod_scheduler_job():
-    """Scheduled EOD close — skips if kill switch was manually set by user."""
-    close_all_positions_eod("EOD Auto-Close 15:20")
-
-
-def _block_entries_job():
-    """Block new entries at 15:15 — only if trading was enabled (don't overwrite manual halt)."""
-    if db.is_trading_enabled(TRADING_MODE):
-        db.set_trading_enabled(False, TRADING_MODE, "Market closed 15:15")
-        logger.info("Scheduler: new entries blocked at 15:15")
-        send_message("*Market Closed*\nNew entries blocked (15:15 IST)")
-
-
-def _enable_trading_job():
-    """Re-enable trading at 09:10 AM — fresh day."""
-    db.set_trading_enabled(True, TRADING_MODE, "")
-    logger.info("Scheduler: trading enabled at 09:10")
-    send_message("*Market Pre-Open*\nTrading enabled (09:10 IST)")
-
-
-def start_scheduler():
-    try:
-        from apscheduler.schedulers.background import BackgroundScheduler
-
-        scheduler = BackgroundScheduler(timezone=IST)
-
-        scheduler.add_job(
-            _eod_scheduler_job,
-            trigger="cron", hour=15, minute=20,
-            day_of_week="mon-fri", id="eod_close", replace_existing=True
-        )
-        scheduler.add_job(
-            _block_entries_job,
-            trigger="cron", hour=15, minute=15,
-            day_of_week="mon-fri", id="block_entries", replace_existing=True
-        )
-        scheduler.add_job(
-            _enable_trading_job,
-            trigger="cron", hour=9, minute=10,
-            day_of_week="mon-fri", id="enable_trading", replace_existing=True
-        )
-
-        scheduler.start()
-        logger.info("Scheduler started: enable 09:10 | block 15:15 | EOD close 15:20 IST")
-        return scheduler
-
-    except Exception as e:
-        logger.error(f"Scheduler failed to start: {e}")
-        return None
-
-
-scheduler = start_scheduler()
-
-
-# ── Pages ──────────────────────────────────────────────────────────────────
-
-@app.route("/")
-def index():
-    return render_template("dashboard.html")
-
-@app.route("/dashboard")
-def dashboard():
-    return render_template("dashboard.html")
-
-@app.route("/analysis")
-def analysis():
-    return render_template("analysis.html")
-
-@app.route("/backtesting")
-def backtesting():
-    return render_template("backtesting.html")
-
-@app.route("/options")
-def options():
-    return render_template("options.html")
-
-
-# ── Health ─────────────────────────────────────────────────────────────────
-
-@app.route("/health")
-@app.route("/api/health")
-def health():
-    uptime = int(time.time() - START_TIME)
-    try:
-        db.get_account(TRADING_MODE)
-        db_status = "connected"
-    except Exception:
-        db_status = "error"
-    return jsonify({
-        "status":          "healthy",
-        "version":         "7.0",
-        "mode":            TRADING_MODE,
-        "timestamp":       ist_now(),
-        "database":        db_status,
-        "telegram":        "enabled" if TELEGRAM_ENABLED else "disabled",
-        "risk_manager":    "active" if ENABLE_RISK_MANAGEMENT else "disabled",
-        "strategy":        "active" if STRATEGY_AVAILABLE else "fallback",
-        "backtesting":     "active" if BACKTESTING_AVAILABLE else "unavailable",
-        "uptime_seconds":  uptime,
-        "lot_size":        LOT_SIZE,
-        "trading_enabled": db.is_trading_enabled(TRADING_MODE),
-        "scheduler":       "active" if scheduler else "inactive",
-    })
-
-
-# ── Portfolio ──────────────────────────────────────────────────────────────
-
-@app.route("/api/portfolio")
-@app.route("/api/account")
-def api_portfolio():
-    try:
-        summary = portfolio.get_summary(TRADING_MODE)
-        return jsonify({"success": True, **summary})
-    except Exception as e:
-        resp, code = handle_exception(e)
-        return jsonify(resp), code
-
-
-@app.route("/api/equity_curve")
-def api_equity_curve():
-    try:
-        positions = db.get_all_positions(TRADING_MODE, status="CLOSED", limit=500)
-        account   = db.get_account(TRADING_MODE)
-        capital   = INITIAL_CAPITAL
-        curve     = [{"timestamp": "Start", "capital": capital}]
-        for p in reversed(positions):
-            if p.get("pnl") is not None:
-                capital += p["pnl"] - p.get("total_charges", 0)
-                curve.append({"timestamp": p.get("exit_time", ""), "capital": round(capital, 2)})
-        return jsonify({
-            "success":         True,
-            "data":            curve,
-            "initial_capital": INITIAL_CAPITAL,
-            "current_capital": account["current_capital"] if account else INITIAL_CAPITAL
-        })
-    except Exception as e:
-        resp, code = handle_exception(e)
-        return jsonify(resp), code
-
-
-# ── Positions ──────────────────────────────────────────────────────────────
-
-@app.route("/api/positions")
-def api_positions():
-    try:
-        status    = request.args.get("status")
-        limit     = int(request.args.get("limit", 50))
-        symbol    = request.args.get("symbol")
-        positions = db.get_all_positions(TRADING_MODE, status=status, limit=limit)
-        if symbol:
-            positions = [p for p in positions if p["symbol"] == symbol.upper()]
-        stats = db.get_trade_stats(TRADING_MODE)
-        return jsonify({"success": True, "positions": positions, "total": len(positions), "stats": stats})
-    except Exception as e:
-        resp, code = handle_exception(e)
-        return jsonify(resp), code
-
-
-@app.route("/api/options/positions")
-def api_option_positions():
-    try:
-        positions = db.get_open_option_positions(TRADING_MODE)
-        return jsonify({"success": True, "positions": positions, "total": len(positions)})
-    except Exception as e:
-        resp, code = handle_exception(e)
-        return jsonify(resp), code
-
-
-@app.route("/api/options/history")
-def api_option_history():
-    """NEW (BOT-05) - lists option trades (open, closed, or both via
-    ?status=). Previously there was no endpoint to see closed option
-    trades at all — only /api/options/positions (open-only) existed."""
-    try:
-        status    = request.args.get("status")  # omit for all, or OPEN/CLOSED
-        limit     = int(request.args.get("limit", 50))
-        positions = db.get_all_option_positions(TRADING_MODE, status=status, limit=limit)
-        return jsonify({"success": True, "positions": positions, "total": len(positions)})
-    except Exception as e:
-        resp, code = handle_exception(e)
-        return jsonify(resp), code
-
-
-# ── Kill Switch ────────────────────────────────────────────────────────────
-
-@app.route("/api/kill-switch", methods=["GET", "POST"])
-def kill_switch():
-    if request.method == "GET":
-        trading_enabled = db.is_trading_enabled(TRADING_MODE)
-        account         = db.get_account(TRADING_MODE)
-        reason          = account.get("kill_switch_reason", "") if account else ""
-        return jsonify({
-            "success":             True,
-            "trading_enabled":     trading_enabled,
-            "kill_switch_reason":  reason
-        })
-    try:
-        payload = request.get_json(silent=True) or {}
-        verify_webhook_secret(payload)
-        enabled = bool(payload.get("enabled", True))
-        reason  = payload.get("reason", "")
-        db.set_trading_enabled(enabled, TRADING_MODE, reason)
-        status_text = "RESUMED" if enabled else "HALTED"
-        msg = f"Kill switch: Trading {status_text}"
-        if reason:
-            msg += f" - {reason}"
-        send_message(f"*{msg}*\nTime: `{ist_now()}`")
-        logger.info(msg)
-        return jsonify({"success": True, "trading_enabled": enabled, "message": msg})
-    except Exception as e:
-        resp, code = handle_exception(e)
-        return jsonify(resp), code
-
-
-# ── Emergency Close All ────────────────────────────────────────────────────
-
-@app.route("/api/emergency-close", methods=["POST"])
-def api_emergency_close():
-    """
-    Manually close ALL open positions immediately.
-    Requires webhook secret. Used by dashboard Close All button.
-    Flags estimated prices in exit_reason.
-    """
-    try:
-        payload = request.get_json(silent=True) or {}
-        verify_webhook_secret(payload)
-        reason = payload.get("reason", "Emergency Close - Manual")
-        closed = close_all_positions_eod(reason)
-        return jsonify({
-            "success": True,
-            "message": f"Closed {closed} position(s)",
-            "closed":  closed
-        })
-    except Exception as e:
-        resp, code = handle_exception(e)
-        return jsonify(resp), code
-
-
-# ── EOD Manual Trigger ─────────────────────────────────────────────────────
-
-@app.route("/api/eod-close", methods=["POST"])
-def api_eod_close():
-    """Manually trigger EOD close logic (requires webhook secret)."""
-    try:
-        payload = request.get_json(silent=True) or {}
-        verify_webhook_secret(payload)
-        closed = close_all_positions_eod("Manual EOD Close")
-        return jsonify({"success": True, "message": f"EOD close triggered - {closed} position(s) closed"})
-    except Exception as e:
-        resp, code = handle_exception(e)
-        return jsonify(resp), code
-
-
-# ── Close Single Position ──────────────────────────────────────────────────
-
-@app.route("/api/positions/<pos_id>/close", methods=["POST"])
-def api_close_position(pos_id):
-    """
-    Close a single position by ID.
-    Used by dashboard per-position close button.
-    """
-    try:
-        payload = request.get_json(silent=True) or {}
-        verify_webhook_secret(payload)
-
-        position = db.get_position_by_id(pos_id)
-        if not position:
-            return jsonify({"success": False, "message": f"Position {pos_id} not found"}), 404
-        if position.get("status") != "OPEN":
-            return jsonify({"success": False, "message": "Position is not open"}), 400
-
-        # Get price
-        close_price, price_live = _get_nifty_price()
-        price_flag  = "" if price_live else " [ESTIMATED PRICE]"
-        exit_reason = f"Manual Close{price_flag}"
-
-        result = portfolio.apply_trade_close(
-            position, close_price, exit_reason, TRADING_MODE
-        )
-        notify_trade_close(
-            position["symbol"], position["action"],
-            position["entry_price"], close_price,
-            position["quantity"], result["gross_pnl"],
-            exit_reason, result["total_charges"]
-        )
-        logger.info(
-            f"Manual close: {position['action']} {position['symbol']} "
-            f"@ Rs.{close_price:,.2f} pnl=Rs.{result['net_pnl']:,.2f}{price_flag}"
-        )
-        return jsonify({
-            "success":    True,
-            "message":    "Position closed",
-            "exit_price": close_price,
-            "pnl":        result["gross_pnl"],
-            "net_pnl":    result["net_pnl"],
-            "charges":    result["total_charges"],
-            "price_live": price_live,
-        })
-    except Exception as e:
-        resp, code = handle_exception(e)
-        return jsonify(resp), code
-
-
-# ── Webhook ────────────────────────────────────────────────────────────────
-
-@app.route("/api/webhook", methods=["POST"])
-def api_webhook():
-    try:
-        ip = request.remote_addr or "unknown"
-        if not rate_limit(f"webhook:{ip}"):
-            return jsonify({"success": False, "message": "Rate limit exceeded"}), 429
-
-        payload = request.get_json(silent=True)
-        if not payload:
-            return jsonify({"success": False, "message": "Invalid JSON payload"}), 400
-
-        verify_webhook_secret(payload)
-
-        raw_action = payload.get("action", "").upper()
-        if not raw_action:
-            return jsonify({"success": False, "message": "action field required"}), 400
-
-        action = normalise_action(raw_action)
-        if action not in VALID_ACTIONS:
-            raise InvalidActionError(raw_action, list(VALID_ACTIONS))
-
-        symbol = payload.get("symbol", "NIFTY").upper()
-
-        if action in ("BUY", "SELL"):
-            return _handle_open(payload, action, symbol)
-        elif action in ("EXIT", "EXIT_LONG", "EXIT_SHORT"):
-            return _handle_exit(payload, symbol)
-        elif action == "BUY_OPTION":
-            return _handle_open_option(payload, symbol)
-        elif action == "EXIT_OPTION":
-            return _handle_exit_option(payload, symbol)
-
-        return jsonify({"success": False, "message": f"Unhandled action: {action}"}), 400
-
-    except Exception as e:
-        resp, code = handle_exception(e)
-        return jsonify(resp), code
-
-
-def _handle_open(payload: dict, action: str, symbol: str):
-    entry = float(payload.get("price", 0))
-    if entry <= 0:
-        return jsonify({"success": False, "message": "Valid price required"}), 400
-
-    # Block new entries at or after 15:00 IST
-    now_ist = datetime.now(IST)
-    if now_ist.hour >= 15:
-        return jsonify({
-            "success": False,
-            "message": "New entries blocked after 15:00 IST (intraday only)"
-        }), 400
-
-    qty       = int(payload.get("quantity", LOT_SIZE))
-    sl        = float(payload.get("sl", 0)) or None
-    tp        = float(payload.get("tp", 0)) or None
-    atr       = float(payload.get("atr", 0)) or None
-    adx       = float(payload.get("adx", 0)) or None
-    confluence = int(payload.get("confluence_score", 0))
-
-    is_valid, details = risk_mgr.validate_new_trade(
-        symbol, entry, sl or 0, tp or 0, TRADING_MODE
-    )
-    if not is_valid:
-        if details.get("circuit_breaker"):
-            notify_circuit_breaker(details["message"])
-        return jsonify({"success": False, "message": details["message"], "details": details}), 400
-
-    charges = calculate_equity_charges(entry, qty, "BUY")
-    pos_id  = db.open_position(
-        mode=TRADING_MODE, symbol=symbol, action=action,
-        entry_price=entry, quantity=qty,
-        stop_loss=sl, take_profit=tp,
-        entry_charges=charges, atr=atr, adx=adx,
-        confluence_score=confluence
-    )
-
-    account = db.get_account(TRADING_MODE)
-    db.update_account(TRADING_MODE, current_capital=round(account["current_capital"] - charges, 2))
-
-    notify_trade_open(symbol, action, entry, qty, sl, tp, pos_id, charges)
-    logger.info(f"Position opened: {action} {symbol} @ Rs.{entry} qty={qty}")
-
-    return jsonify({
-        "success":     True,
-        "message":     "Position opened",
-        "position_id": pos_id,
-        "symbol":      symbol,
-        "action":      action,
-        "entry_price": entry,
-        "quantity":    qty,
-        "charges":     charges,
-    })
-
-
-def _handle_exit(payload: dict, symbol: str):
-    exit_price = float(payload.get("price", 0))
-    if exit_price <= 0:
-        return jsonify({"success": False, "message": "Valid exit price required"}), 400
-
-    position = db.get_open_position_by_symbol(symbol, TRADING_MODE)
-    if not position:
-        raise PositionNotFoundError(symbol=symbol)
-
-    reason = payload.get("exit_reason", "Signal Exit")
-    result = portfolio.apply_trade_close(position, exit_price, reason, TRADING_MODE)
-
-    notify_trade_close(
-        symbol, position["action"],
-        position["entry_price"], exit_price,
-        position["quantity"], result["gross_pnl"],
-        reason, result["total_charges"]
-    )
-    logger.info(f"Position closed: {symbol} @ Rs.{exit_price} pnl=Rs.{result['net_pnl']}")
-
-    return jsonify({
-        "success":     True,
-        "message":     "Position closed",
-        "position_id": position["id"],
-        "exit_price":  exit_price,
-        "pnl":         result["gross_pnl"],
-        "net_pnl":     result["net_pnl"],
-        "charges":     result["total_charges"],
-        "exit_reason": reason,
-    })
-
-
-def _handle_open_option(payload: dict, symbol: str):
-    option_symbol = payload.get("option_symbol", "")
-    option_type   = payload.get("option_type", "CE").upper()
-    strike        = float(payload.get("strike", 0))
-    expiry        = payload.get("expiry", "")
-    premium       = float(payload.get("premium", 0))
-    qty           = int(payload.get("quantity", LOT_SIZE))
-    sl            = float(payload.get("sl", 0)) or None
-    tp            = float(payload.get("tp", 0)) or None
-
-    if not option_symbol or premium <= 0:
-        return jsonify({"success": False, "message": "option_symbol and premium required"}), 400
-
-    charges = calculate_option_charges(premium, qty, "BUY")
-    pos_id  = db.open_option_position(
-        mode=TRADING_MODE, underlying=symbol,
-        option_symbol=option_symbol, option_type=option_type,
-        strike=strike, expiry=expiry, premium=premium,
-        quantity=qty, stop_loss=sl, take_profit=tp,
-        entry_charges=charges
-    )
-
-    account = db.get_account(TRADING_MODE)
-    cost    = premium * qty + charges
-    db.update_account(TRADING_MODE, current_capital=round(account["current_capital"] - cost, 2))
-
-    notify_trade_open(option_symbol, f"BUY {option_type}", premium, qty, sl, tp, pos_id, charges)
-    logger.info(f"Option opened: {option_symbol} @ Rs.{premium} qty={qty}")
-
-    return jsonify({
-        "success":       True,
-        "message":       "Option position opened",
-        "position_id":   pos_id,
-        "option_symbol": option_symbol,
-        "premium":       premium,
-        "quantity":      qty,
-        "charges":       charges,
-    })
-
-
-def _handle_exit_option(payload: dict, symbol: str):
-    option_symbol = payload.get("option_symbol", "")
-    exit_premium  = float(payload.get("premium", 0))
-
-    if not option_symbol:
-        return jsonify({"success": False, "message": "option_symbol required for EXIT_OPTION"}), 400
-
-    position = db.get_open_option_by_symbol(option_symbol, TRADING_MODE)
-    if not position:
-        raise PositionNotFoundError(symbol=option_symbol)
-
-    reason = payload.get("exit_reason", "Signal Exit")
-    result = portfolio.apply_trade_close(position, exit_premium, reason, TRADING_MODE)
-
-    notify_trade_close(
-        option_symbol, "SELL",
-        position["premium"], exit_premium,
-        position["quantity"], result["gross_pnl"],
-        reason, result["total_charges"]
-    )
-
-    return jsonify({
-        "success":       True,
-        "message":       "Option position closed",
-        "position_id":   position["id"],
-        "exit_premium":  exit_premium,
-        "pnl":           result["gross_pnl"],
-        "net_pnl":       result["net_pnl"],
-        "charges":       result["total_charges"],
-    })
-
-
-# ── Analysis ───────────────────────────────────────────────────────────────
-
-@app.route("/api/analysis/quick")
-def api_analysis_quick():
-    symbol = request.args.get("symbol", "NIFTY").upper()
-    try:
-        if strategy_engine:
-            result = strategy_engine.analyze(symbol)
-        else:
-            from enhanced_strategy import quick_analysis
-            result = quick_analysis(symbol)
-        return jsonify({"success": True, **result})
-    except Exception as e:
-        resp, code = handle_exception(e)
-        return jsonify(resp), code
-
-
-@app.route("/api/analyze/<symbol>")
-def api_analyze_symbol(symbol):
-    try:
-        from enhanced_strategy import quick_analysis
-        result = quick_analysis(symbol.upper())
-        return jsonify({"success": True, **result})
-    except Exception as e:
-        resp, code = handle_exception(e)
-        return jsonify(resp), code
-
-
-@app.route("/api/market/status")
-def api_market_status():
-    now_ist = datetime.now(IST)
-    hour    = now_ist.hour
-    minute  = now_ist.minute
-    weekday = now_ist.weekday()
-    if weekday >= 5:
-        status = "CLOSED"
-    elif (hour == 9 and minute >= 15) or (10 <= hour < 15) or (hour == 15 and minute <= 15):
-        status = "OPEN"
-    elif hour == 9 and minute < 15:
-        status = "PRE_OPEN"
-    else:
-        status = "CLOSED"
-    return jsonify({
-        "status":           status,
-        "current_time_ist": now_ist.strftime("%H:%M:%S"),
-        "opens_at":         "09:15",
-        "closes_at":        "15:15",
-        "eod_auto_close":   "15:20",
-        "timezone":         "Asia/Kolkata",
-        "is_weekday":       weekday < 5,
-    })
-
-
-# ── Risk ───────────────────────────────────────────────────────────────────
-
-@app.route("/api/risk/report")
-def api_risk_report():
-    try:
-        report = risk_mgr.get_risk_report(TRADING_MODE)
-        return jsonify({"success": True, "timestamp": ist_now(), **report})
-    except Exception as e:
-        resp, code = handle_exception(e)
-        return jsonify(resp), code
-
-
-@app.route("/api/risk/validate", methods=["POST"])
-def api_risk_validate():
-    try:
-        data      = request.get_json(silent=True) or {}
-        symbol    = data.get("symbol", "NIFTY")
-        entry     = float(data.get("price", 0))
-        sl        = float(data.get("sl", 0))
-        tp        = float(data.get("tp", 0))
-        is_valid, details = risk_mgr.validate_new_trade(symbol, entry, sl, tp, TRADING_MODE)
-        size      = risk_mgr.calculate_position_size(entry, sl, TRADING_MODE) if is_valid else 0
-        return jsonify({"success": True, "accepted": is_valid, "details": details, "recommended_quantity": size})
-    except Exception as e:
-        resp, code = handle_exception(e)
-        return jsonify(resp), code
-
-
-# ── Backtesting ────────────────────────────────────────────────────────────
-
-@app.route("/api/backtest", methods=["POST"])
-def api_backtest():
-    if not BACKTESTING_AVAILABLE:
-        return jsonify({"success": False, "error": "Backtesting not available"}), 503
-    try:
-        data   = request.get_json(silent=True) or {}
-        result = backtester.run(
-            symbol     = data.get("symbol", "NIFTY"),
-            timeframe  = data.get("timeframe", "15m"),
-            start_date = data.get("start_date", "2025-01-01"),
-            end_date   = data.get("end_date", "2025-12-31"),
-            parameters = data.get("parameters", {})
-        )
-        return jsonify(result)
-    except Exception as e:
-        resp, code = handle_exception(e)
-        return jsonify(resp), code
-
-
-# ── Telegram ───────────────────────────────────────────────────────────────
-
-@app.route("/api/telegram/test")
-def api_telegram_test():
-    result = test_connection()
-    code   = 200 if result["success"] else 503
-    return jsonify(result), code
-
-
-@app.route("/api/telegram/status")
-def api_telegram_status():
-    return jsonify(tg_status())
-
-
-# ── System ─────────────────────────────────────────────────────────────────
-
-@app.route("/api/system/info")
-def api_system_info():
-    import sys
-    from flask import __version__ as flask_ver
-    return jsonify({
-        "version":                 "7.0",
-        "trading_mode":            TRADING_MODE,
-        "initial_capital":         INITIAL_CAPITAL,
-        "lot_size":                LOT_SIZE,
-        "risk_management_enabled": ENABLE_RISK_MANAGEMENT,
-        "enhanced_strategy":       STRATEGY_AVAILABLE,
-        "backtesting":             BACKTESTING_AVAILABLE,
-        "python_version":          sys.version.split()[0],
-        "flask_version":           flask_ver,
-        "uptime_seconds":          int(time.time() - START_TIME),
-        "trading_enabled":         db.is_trading_enabled(TRADING_MODE),
-        "scheduler":               "active" if scheduler else "inactive",
-        "eod_auto_close":          "15:20 IST weekdays",
-    })
-
-
-# ── Error handlers ─────────────────────────────────────────────────────────
-
-@app.errorhandler(404)
-def not_found(e):
-    return jsonify({"success": False, "message": "Endpoint not found"}), 404
-
-@app.errorhandler(405)
-def method_not_allowed(e):
-    return jsonify({"success": False, "message": "Method not allowed"}), 405
-
-@app.errorhandler(500)
-def internal_error(e):
-    logger.error(f"Internal error: {e}")
-    return jsonify({"success": False, "message": "Internal server error"}), 500
-
-
-# ── Startup ────────────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    logger.info("=" * 60)
-    logger.info("PAPER TRADING SYSTEM v7.0")
-    logger.info(f"Mode:    {TRADING_MODE}")
-    logger.info(f"Capital: Rs.{INITIAL_CAPITAL:,.2f}")
-    logger.info(f"Lot:     {LOT_SIZE} units")
-    logger.info("Intraday: entries blocked after 15:00 IST")
-    logger.info("EOD auto-close: 15:20 IST weekdays")
-    logger.info("=" * 60)
-    notify_startup(INITIAL_CAPITAL, TRADING_MODE)
-    app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
+            """, (mode, mode))
+            row = dict(c.fetchone())
+            total = row["total_trades"] or 0
+            wins = row["wins"] or 0
+            row["win_rate"] = round((wins / total * 100), 2) if total > 0 else 0.0
+            gross_profit = abs(row["avg_win"] * wins) if wins else 0
+            gross_loss = abs(row["avg_loss"] * (row["losses"] or 0))
+            row["profit_factor"] = round(gross_profit / gross_loss, 2) if gross_loss > 0 else 0.0
+            return row
+
+    def get_consecutive_losses(self, mode: str = "PAPER") -> int:
+        with self.get_cursor() as c:
+            c.execute("""
+                SELECT pnl FROM positions
+                WHERE mode=? AND status='CLOSED'
+                ORDER BY exit_time DESC LIMIT 20
+            """, (mode,))
+            rows = c.fetchall()
+            count = 0
+            for r in rows:
+                if r["pnl"] < 0:
+                    count += 1
+                else:
+                    break
+            return count
+
+    def get_daily_pnl(self, mode: str = "PAPER") -> float:
+        """Unions positions + option_positions so risk management /
+        circuit breakers actually see option P&L for the day."""
+        today = datetime.now().strftime("%Y-%m-%d")
+        with self.get_cursor() as c:
+            c.execute("""
+                SELECT COALESCE(SUM(pnl), 0) as daily_pnl FROM (
+                    SELECT pnl FROM positions
+                    WHERE mode=? AND status='CLOSED' AND DATE(exit_time)=?
+                    UNION ALL
+                    SELECT pnl FROM option_positions
+                    WHERE mode=? AND status='CLOSED' AND DATE(exit_time)=?
+                )
+            """, (mode, today, mode, today))
+            return c.fetchone()["daily_pnl"] or 0.0
+
+    def get_trades_today(self, mode: str = "PAPER") -> int:
+        """Unions positions + option_positions."""
+        today = datetime.now().strftime("%Y-%m-%d")
+        with self.get_cursor() as c:
+            c.execute("""
+                SELECT COUNT(*) as cnt FROM (
+                    SELECT id FROM positions WHERE mode=? AND DATE(entry_time)=?
+                    UNION ALL
+                    SELECT id FROM option_positions WHERE mode=? AND DATE(entry_time)=?
+                )
+            """, (mode, today, mode, today))
+            return c.fetchone()["cnt"] or 0
