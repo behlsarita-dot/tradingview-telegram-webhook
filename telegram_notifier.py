@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 Telegram Notifier - Paper Trading System v7.0
 Pure synchronous telebot implementation. No async loops.
@@ -30,6 +30,8 @@ def _get_bot():
         return None
     try:
         import telebot
+        telebot.apihelper.CONNECT_TIMEOUT = 5
+        telebot.apihelper.READ_TIMEOUT = TELEGRAM_TIMEOUT
         _bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN, threaded=False)
         _bot_user = _bot.get_me()
         _bot_ready = True
