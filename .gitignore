@@ -37,3 +37,5 @@ Thumbs.db
 
 # Config with secrets
 pnl_config.json
+# EOD snapshot output (local archive, also sent to Telegram)
+eod_reports/
