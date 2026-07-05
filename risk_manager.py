@@ -47,8 +47,15 @@ class RiskManager:
         if not can:
             return False, {"message": reason, "circuit_breaker": True}
 
+        # Combine equity/futures positions with option positions — an
+        # options-only trader was previously invisible to both of these
+        # checks, since only get_open_positions() (equity table) was
+        # consulted. MAX_OPEN_POSITIONS could be silently exceeded, and
+        # portfolio heat would read near-zero with several options open.
         open_pos = self.db.get_open_positions(mode)
-        if len(open_pos) >= MAX_OPEN_POSITIONS:
+        open_opts = self.db.get_open_option_positions(mode)
+        all_open = open_pos + open_opts
+        if len(all_open) >= MAX_OPEN_POSITIONS:
             return False, {"message": f"Max open positions reached ({MAX_OPEN_POSITIONS})"}
 
         trades_today = self.db.get_trades_today(mode)
@@ -66,7 +73,7 @@ class RiskManager:
                         "rr_ratio": round(rr, 2)
                     }
 
-        heat = self._calculate_portfolio_heat(open_pos, capital)
+        heat = self._calculate_portfolio_heat(all_open, capital)
         if heat >= MAX_PORTFOLIO_HEAT:
             return False, {"message": f"Portfolio heat {heat:.1f}% at maximum {MAX_PORTFOLIO_HEAT}%"}
 
@@ -74,7 +81,7 @@ class RiskManager:
             "message": "Trade approved",
             "portfolio_heat": round(heat, 2),
             "trades_today": trades_today,
-            "open_positions": len(open_pos)
+            "open_positions": len(all_open)
         }
 
     def _check_circuit_breakers(self, account: Dict, mode: str) -> Tuple[bool, str]:
@@ -115,11 +122,17 @@ class RiskManager:
             return 0.0
         total_risk = 0.0
         for pos in open_positions:
-            entry = pos.get("entry_price", 0)
+            # Equity/futures rows use entry_price; option rows use premium.
+            entry = pos.get("entry_price") if pos.get("entry_price") is not None else pos.get("premium", 0)
             sl = pos.get("stop_loss", 0)
             qty = pos.get("quantity", 0)
             if entry and sl and qty:
                 total_risk += abs(entry - sl) * qty
+            elif entry and qty and "premium" in pos:
+                # Long options with no stop_loss set: max loss is capped at
+                # the premium paid, so use that as the risk contribution
+                # instead of silently counting it as zero heat.
+                total_risk += entry * qty
         return (total_risk / capital) * 100
 
     def calculate_position_size(self, entry: float, sl: float,
@@ -185,7 +198,7 @@ class RiskManager:
         drawdown = self._calculate_drawdown(capital, mode)
         daily_pnl = self.db.get_daily_pnl(mode)
         consec = self.db.get_consecutive_losses(mode)
-        open_pos = self.db.get_open_positions(mode)
+        open_pos = self.db.get_open_positions(mode) + self.db.get_open_option_positions(mode)
         heat = self._calculate_portfolio_heat(open_pos, capital)
         multiplier = self._size_multiplier(capital, mode)
         trading_enabled = self.db.is_trading_enabled(mode)

@@ -719,6 +719,22 @@ def _handle_open_option(payload: dict, symbol: str):
     if not option_symbol or premium <= 0:
         return jsonify({"success": False, "message": "option_symbol and premium required"}), 400
 
+    # Options risk is measured in premium terms (the Pine script computes
+    # sl/tp off the option chart's own close, i.e. premium — not the
+    # underlying's price), so premium stands in for "entry" here. This was
+    # previously skipped entirely for options: kill switch, drawdown,
+    # daily-loss, consecutive-loss, max-positions/trades, R:R, and
+    # portfolio-heat checks all only ran for equity trades via
+    # _handle_open(). An option BUY could open even with the kill switch
+    # active or the daily loss limit already breached.
+    is_valid, details = risk_mgr.validate_new_trade(
+        option_symbol, premium, sl or 0, tp or 0, TRADING_MODE
+    )
+    if not is_valid:
+        if details.get("circuit_breaker"):
+            notify_circuit_breaker(details["message"])
+        return jsonify({"success": False, "message": details["message"], "details": details}), 400
+
     charges = calculate_option_charges(premium, qty, "BUY")
     pos_id  = db.open_option_position(
         mode=TRADING_MODE, underlying=symbol,
