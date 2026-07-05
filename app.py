@@ -440,6 +440,21 @@ def api_option_positions():
         return jsonify(resp), code
 
 
+@app.route("/api/options/history")
+def api_option_history():
+    """NEW (BOT-05) - lists option trades (open, closed, or both via
+    ?status=). Previously there was no endpoint to see closed option
+    trades at all — only /api/options/positions (open-only) existed."""
+    try:
+        status    = request.args.get("status")  # omit for all, or OPEN/CLOSED
+        limit     = int(request.args.get("limit", 50))
+        positions = db.get_all_option_positions(TRADING_MODE, status=status, limit=limit)
+        return jsonify({"success": True, "positions": positions, "total": len(positions)})
+    except Exception as e:
+        resp, code = handle_exception(e)
+        return jsonify(resp), code
+
+
 # ── Kill Switch ────────────────────────────────────────────────────────────
 
 @app.route("/api/kill-switch", methods=["GET", "POST"])
@@ -928,3 +943,4 @@ if __name__ == "__main__":
     logger.info("=" * 60)
     notify_startup(INITIAL_CAPITAL, TRADING_MODE)
     app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
+    
