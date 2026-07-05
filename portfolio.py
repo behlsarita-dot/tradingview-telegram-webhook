@@ -85,7 +85,6 @@ class PortfolioManager:
             for p in opt_pos
         )
         total_locked = locked_equity + locked_options
-
         unrealized_pnl = sum(p.get("unrealized_pnl", 0) for p in open_pos)
 
         capital = account["current_capital"]
@@ -114,20 +113,33 @@ class PortfolioManager:
 
     def apply_trade_close(self, position: Dict, exit_price: float,
                           exit_reason: str, mode: str = "PAPER") -> Dict:
-        entry = position["entry_price"]
+        """
+        Close a position. Works for both equity and options.
+        Options use 'premium' as entry price, equity uses 'entry_price'.
+        """
+        is_option = "option_symbol" in position
+
+        # Get correct entry price field
+        if is_option:
+            entry = position.get("premium", 0.0)
+            action = "BUY"  # options are always bought long
+        else:
+            entry = position.get("entry_price", 0.0)
+            action = position.get("action", "BUY")
+
         qty = position["quantity"]
-        action = position.get("action", "BUY")
         entry_ch = position.get("entry_charges", 0.0)
 
-        is_option = "option_symbol" in position
+        # Calculate exit charges
         if is_option:
             exit_ch = calculate_option_charges(exit_price, qty, "SELL")
         else:
             exit_ch = calculate_equity_charges(exit_price, qty, "SELL")
 
         gross, net = calculate_net_pnl(entry, exit_price, qty, action,
-                                        entry_ch, exit_ch)
+                                       entry_ch, exit_ch)
 
+        # Close in DB
         if is_option:
             self.db.close_option_position(
                 position["id"], exit_price, exit_reason, gross, exit_ch
@@ -137,6 +149,7 @@ class PortfolioManager:
                 position["id"], exit_price, exit_reason, gross, exit_ch
             )
 
+        # Update account capital
         account = self.db.get_account(mode)
         new_cap = account["current_capital"] + net
         new_pnl = account["total_pnl"] + net
