@@ -394,24 +394,39 @@ class DatabaseManager:
     def get_trade_stats(self, mode: str = "PAPER") -> Dict:
         """Unions positions + option_positions so win_rate/profit_factor/
         best_trade/worst_trade reflect option trades too, instead of
-        always showing zero for an options-only strategy."""
+        always showing zero for an options-only strategy.
+
+        FIX (net-of-charges bug): the `pnl` column stores GROSS pnl per
+        trade (charges are tracked separately in `total_charges`). Every
+        aggregate below now subtracts `total_charges` per-row before
+        summing/averaging/min/max, so total_pnl/best_trade/worst_trade/
+        avg_win/avg_loss/profit_factor all reflect real net P&L and line
+        up with account.total_pnl and current_capital movement, instead
+        of silently reporting pre-charges figures.
+        """
         with self.get_cursor() as c:
             c.execute("""
                 SELECT
                     COUNT(*) as total_trades,
-                    SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins,
-                    SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END) as losses,
-                    SUM(CASE WHEN pnl = 0 THEN 1 ELSE 0 END) as breakeven,
-                    COALESCE(SUM(pnl), 0) as total_pnl,
-                    COALESCE(AVG(CASE WHEN pnl > 0 THEN pnl END), 0) as avg_win,
-                    COALESCE(AVG(CASE WHEN pnl < 0 THEN pnl END), 0) as avg_loss,
-                    COALESCE(MAX(pnl), 0) as best_trade,
-                    COALESCE(MIN(pnl), 0) as worst_trade,
+                    SUM(CASE WHEN net_pnl > 0 THEN 1 ELSE 0 END) as wins,
+                    SUM(CASE WHEN net_pnl < 0 THEN 1 ELSE 0 END) as losses,
+                    SUM(CASE WHEN net_pnl = 0 THEN 1 ELSE 0 END) as breakeven,
+                    COALESCE(SUM(net_pnl), 0) as total_pnl,
+                    COALESCE(AVG(CASE WHEN net_pnl > 0 THEN net_pnl END), 0) as avg_win,
+                    COALESCE(AVG(CASE WHEN net_pnl < 0 THEN net_pnl END), 0) as avg_loss,
+                    COALESCE(MAX(net_pnl), 0) as best_trade,
+                    COALESCE(MIN(net_pnl), 0) as worst_trade,
                     COALESCE(SUM(total_charges), 0) as total_charges
                 FROM (
-                    SELECT pnl, total_charges FROM positions WHERE mode=? AND status='CLOSED'
+                    SELECT
+                        pnl - total_charges as net_pnl,
+                        total_charges
+                    FROM positions WHERE mode=? AND status='CLOSED'
                     UNION ALL
-                    SELECT pnl, total_charges FROM option_positions WHERE mode=? AND status='CLOSED'
+                    SELECT
+                        pnl - total_charges as net_pnl,
+                        total_charges
+                    FROM option_positions WHERE mode=? AND status='CLOSED'
                 )
             """, (mode, mode))
             row = dict(c.fetchone())
@@ -426,14 +441,14 @@ class DatabaseManager:
     def get_consecutive_losses(self, mode: str = "PAPER") -> int:
         with self.get_cursor() as c:
             c.execute("""
-                SELECT pnl FROM positions
+                SELECT pnl - total_charges as net_pnl FROM positions
                 WHERE mode=? AND status='CLOSED'
                 ORDER BY exit_time DESC LIMIT 20
             """, (mode,))
             rows = c.fetchall()
             count = 0
             for r in rows:
-                if r["pnl"] < 0:
+                if r["net_pnl"] < 0:
                     count += 1
                 else:
                     break
@@ -441,15 +456,24 @@ class DatabaseManager:
 
     def get_daily_pnl(self, mode: str = "PAPER") -> float:
         """Unions positions + option_positions so risk management /
-        circuit breakers actually see option P&L for the day."""
+        circuit breakers actually see option P&L for the day.
+
+        FIX (net-of-charges bug): previously summed the raw `pnl` column,
+        which is GROSS P&L per trade. That under-reported real daily loss
+        by the day's total charges (e.g. -13.81 reported vs -153.65 real
+        on 2026-07-07), which meant the MAX_DAILY_LOSS circuit breaker in
+        risk_manager.py was checking a smaller number than the account's
+        actual daily drawdown. Now sums (pnl - total_charges) per row so
+        it matches current_capital movement for the day.
+        """
         today = datetime.now().strftime("%Y-%m-%d")
         with self.get_cursor() as c:
             c.execute("""
-                SELECT COALESCE(SUM(pnl), 0) as daily_pnl FROM (
-                    SELECT pnl FROM positions
+                SELECT COALESCE(SUM(pnl - total_charges), 0) as daily_pnl FROM (
+                    SELECT pnl, total_charges FROM positions
                     WHERE mode=? AND status='CLOSED' AND DATE(exit_time)=?
                     UNION ALL
-                    SELECT pnl FROM option_positions
+                    SELECT pnl, total_charges FROM option_positions
                     WHERE mode=? AND status='CLOSED' AND DATE(exit_time)=?
                 )
             """, (mode, today, mode, today))
