@@ -350,30 +350,69 @@ def options():
 
 
 # ── Health ─────────────────────────────────────────────────────────────────
+# CHANGED: db.get_account() and db.is_trading_enabled() used to run on every
+# single /health hit. Render's own infra poller was hitting /health every
+# ~5 seconds around the clock (confirmed in Render logs), which meant two
+# live Postgres queries every 5 seconds, 24/7 - including nights and
+# weekends when nothing is happening. On a scale-to-zero DB (e.g. Neon free
+# tier), this keeps compute permanently "awake" and burns through the
+# monthly compute-hour budget purely from health-check traffic, unrelated
+# to actual trading activity. Fix: cache the DB status and only refresh it
+# at most once every HEALTH_CACHE_TTL_SECONDS. Response JSON shape is
+# unchanged, so premarket_check.py and everything else keeps working as-is.
+# /api/health/refresh is added as an escape hatch to force a live check
+# on demand (e.g. from premarket_check.py if you want a guaranteed-fresh
+# read instead of a possibly-cached one).
+
+_health_cache = {"database": "unknown", "trading_enabled": True}
+_health_cache_updated_at = 0.0
+HEALTH_CACHE_TTL_SECONDS = 300  # 5 minutes
+
+
+def _refresh_health_cache():
+    global _health_cache, _health_cache_updated_at
+    try:
+        db.get_account(TRADING_MODE)
+        _health_cache["database"] = "connected"
+        _health_cache["trading_enabled"] = db.is_trading_enabled(TRADING_MODE)
+    except Exception:
+        _health_cache["database"] = "error"
+    _health_cache_updated_at = time.time()
+
 
 @app.route("/health")
 @app.route("/api/health")
 def health():
     uptime = int(time.time() - START_TIME)
-    try:
-        db.get_account(TRADING_MODE)
-        db_status = "connected"
-    except Exception:
-        db_status = "error"
+    if time.time() - _health_cache_updated_at > HEALTH_CACHE_TTL_SECONDS:
+        _refresh_health_cache()
     return jsonify({
         "status":          "healthy",
         "version":         "7.0",
         "mode":            TRADING_MODE,
         "timestamp":       ist_now(),
-        "database":        db_status,
+        "database":        _health_cache["database"],
         "telegram":        "enabled" if TELEGRAM_ENABLED else "disabled",
         "risk_manager":    "active" if ENABLE_RISK_MANAGEMENT else "disabled",
         "strategy":        "active" if STRATEGY_AVAILABLE else "fallback",
         "backtesting":     "active" if BACKTESTING_AVAILABLE else "unavailable",
         "uptime_seconds":  uptime,
         "lot_size":        LOT_SIZE,
-        "trading_enabled": db.is_trading_enabled(TRADING_MODE),
+        "trading_enabled": _health_cache["trading_enabled"],
         "scheduler":       "active" if scheduler else "inactive",
+    })
+
+
+@app.route("/api/health/refresh")
+def health_refresh():
+    """Forces an immediate live DB check, bypassing the cache. Use this
+    (not /health) when you specifically need a guaranteed-fresh read,
+    e.g. right after a deploy."""
+    _refresh_health_cache()
+    return jsonify({
+        "database":        _health_cache["database"],
+        "trading_enabled": _health_cache["trading_enabled"],
+        "checked_at":      ist_now(),
     })
 
 
@@ -681,6 +720,19 @@ def _handle_exit(payload: dict, symbol: str):
 
     position = db.get_open_position_by_symbol(symbol, TRADING_MODE)
     if not position:
+        # FIX: alert the desync immediately over Telegram instead of only
+        # surfacing it as a 404 that nobody sees until a manual log audit.
+        # This means the Pine chart thinks it's holding a position (or a
+        # duplicate/stale exit alert fired) that the bot's DB has no record
+        # of as OPEN. The 404 response to TradingView is unchanged below —
+        # this only adds visibility.
+        send_message(
+            f"⚠️ *EXIT signal for untracked position*\n"
+            f"Symbol: `{symbol}`\n"
+            f"Exit price claimed: Rs.{exit_price}\n"
+            f"Bot has no open position for this symbol.\n"
+            f"Time: `{ist_now()}`"
+        )
         raise PositionNotFoundError(symbol=symbol)
 
     reason = payload.get("exit_reason", "Signal Exit")
@@ -775,6 +827,23 @@ def _handle_exit_option(payload: dict, symbol: str):
 
     position = db.get_open_option_by_symbol(option_symbol, TRADING_MODE)
     if not position:
+        # FIX: same desync alert as the equity path above. Confirmed root
+        # cause (2026-07-08): the Pine script tracks its own local
+        # `position` state and has no way to read back whether an earlier
+        # BUY_OPTION webhook actually succeeded on the bot's side (alert()
+        # is fire-and-forget). If that entry was ever rejected or dropped,
+        # the script still believes it's in a trade and will eventually
+        # fire a legitimate-looking EXIT_OPTION for a position the bot
+        # never opened. The bot's 404 here is correct and safe — this just
+        # makes the moment visible instead of discoverable only via a
+        # manual log/CSV audit days later.
+        send_message(
+            f"⚠️ *EXIT signal for untracked position*\n"
+            f"Symbol: `{option_symbol}`\n"
+            f"Reason claimed: {payload.get('exit_reason', '?')}\n"
+            f"Bot has no open position for this symbol — Pine chart and bot DB may be out of sync.\n"
+            f"Time: `{ist_now()}`"
+        )
         raise PositionNotFoundError(symbol=option_symbol)
 
     reason = payload.get("exit_reason", "Signal Exit")
