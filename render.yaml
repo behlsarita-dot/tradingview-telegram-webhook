@@ -36,8 +36,8 @@
         value: INFO
       - key: WEBHOOK_MAX_AGE_SECONDS
         value: "300"
-      - key: DB_FILE
-        value: /tmp/trading_bot.db
+      - key: DATABASE_URL
+        sync: false
       - key: SECRET_KEY
         sync: false
       - key: WEBHOOK_SECRET

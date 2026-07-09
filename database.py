@@ -1,38 +1,65 @@
 ﻿#!/usr/bin/env python3
 """
 Database Manager - Paper Trading System v7.0
+Postgres-backed (psycopg2). Public method signatures are unchanged from the
+previous SQLite version, so risk_manager.py, portfolio.py, app.py, and
+signal_analyzer.py require no changes.
 """
 
-import sqlite3
 import logging
 import uuid
 from contextlib import contextmanager
 from datetime import datetime
 from typing import Optional, List, Dict
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
-from config import DB_FILE, INITIAL_CAPITAL, TRADING_MODE
+import psycopg2
+import psycopg2.extras
+
+from config import DATABASE_URL, INITIAL_CAPITAL, TRADING_MODE
 
 logger = logging.getLogger(__name__)
 
 
+def _ensure_sslmode(database_url: str) -> str:
+    """Force sslmode=require onto the connection string if it isn't already
+    specified. Neon, Render Postgres, and Supabase all require/expect SSL,
+    but a hand-pasted connection string (e.g. copied without the query
+    string, or from a source that formats it differently) could omit it,
+    which either fails to connect or - worse - silently connects without
+    encryption if the provider allows a fallback. This makes the safe
+    behaviour the default regardless of what was pasted in."""
+    parsed = urlparse(database_url)
+    query = parse_qs(parsed.query)
+    if "sslmode" not in query:
+        query["sslmode"] = ["require"]
+        new_query = urlencode(query, doseq=True)
+        parsed = parsed._replace(query=new_query)
+        return urlunparse(parsed)
+    return database_url
+
+
 class DatabaseManager:
-    def __init__(self, db_file: str = DB_FILE):
-        self.db_file = db_file
+    def __init__(self, database_url: str = DATABASE_URL):
+        if not database_url:
+            raise RuntimeError(
+                "DATABASE_URL is not set. Configure a Postgres connection "
+                "string (Render Postgres, Neon, Supabase, etc.) in the "
+                "environment before starting the app."
+            )
+        self.database_url = _ensure_sslmode(database_url)
         self._init_db()
 
     @contextmanager
     def get_cursor(self):
-        conn = sqlite3.connect(self.db_file, timeout=30, check_same_thread=False)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=30000")
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
+        conn = psycopg2.connect(self.database_url, connect_timeout=10)
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         try:
             yield cursor
             conn.commit()
-        except Exception as e:
+        except Exception:
             conn.rollback()
-            raise e
+            raise
         finally:
             cursor.close()
             conn.close()
@@ -41,7 +68,7 @@ class DatabaseManager:
         with self.get_cursor() as c:
             c.execute("""
                 CREATE TABLE IF NOT EXISTS account (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    id SERIAL PRIMARY KEY,
                     mode TEXT NOT NULL DEFAULT 'PAPER',
                     initial_capital REAL NOT NULL,
                     current_capital REAL NOT NULL,
@@ -113,7 +140,7 @@ class DatabaseManager:
 
             c.execute("""
                 CREATE TABLE IF NOT EXISTS risk_metrics (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    id SERIAL PRIMARY KEY,
                     mode TEXT NOT NULL DEFAULT 'PAPER',
                     timestamp TEXT NOT NULL,
                     drawdown_pct REAL DEFAULT 0.0,
@@ -126,7 +153,7 @@ class DatabaseManager:
 
             c.execute("""
                 CREATE TABLE IF NOT EXISTS circuit_breakers (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    id SERIAL PRIMARY KEY,
                     mode TEXT NOT NULL DEFAULT 'PAPER',
                     reason TEXT NOT NULL,
                     triggered_at TEXT NOT NULL,
@@ -135,15 +162,11 @@ class DatabaseManager:
                 )
             """)
 
-            # Add kill switch columns to existing DB if missing
-            c.execute("PRAGMA table_info(account)")
-            cols = [r["name"] for r in c.fetchall()]
-            if "trading_enabled" not in cols:
-                c.execute("ALTER TABLE account ADD COLUMN trading_enabled INTEGER DEFAULT 1")
-            if "kill_switch_reason" not in cols:
-                c.execute("ALTER TABLE account ADD COLUMN kill_switch_reason TEXT")
-            if "peak_capital" not in cols:
-                c.execute("ALTER TABLE account ADD COLUMN peak_capital REAL")
+            # Postgres supports IF NOT EXISTS on ADD COLUMN directly (9.6+),
+            # so no need for the old PRAGMA table_info() introspection dance.
+            c.execute("ALTER TABLE account ADD COLUMN IF NOT EXISTS trading_enabled INTEGER DEFAULT 1")
+            c.execute("ALTER TABLE account ADD COLUMN IF NOT EXISTS kill_switch_reason TEXT")
+            c.execute("ALTER TABLE account ADD COLUMN IF NOT EXISTS peak_capital REAL")
 
             c.execute("SELECT COUNT(*) as cnt FROM account WHERE mode='PAPER'")
             if c.fetchone()["cnt"] == 0:
@@ -154,7 +177,7 @@ class DatabaseManager:
                          daily_pnl, open_positions, total_trades,
                          winning_trades, losing_trades, trading_enabled,
                          peak_capital, created_at, updated_at)
-                    VALUES (?, ?, ?, 0, 0, 0, 0, 0, 0, 1, ?, ?, ?)
+                    VALUES (%s, %s, %s, 0, 0, 0, 0, 0, 0, 1, %s, %s, %s)
                 """, ("PAPER", INITIAL_CAPITAL, INITIAL_CAPITAL, INITIAL_CAPITAL, now, now))
                 logger.info(f"Paper account initialised with Rs.{INITIAL_CAPITAL:,.2f}")
 
@@ -164,11 +187,11 @@ class DatabaseManager:
             # we never silently understate an already-elevated peak.
             c.execute("""
                 UPDATE account
-                SET peak_capital = MAX(current_capital, initial_capital)
+                SET peak_capital = GREATEST(current_capital, initial_capital)
                 WHERE peak_capital IS NULL
             """)
 
-        logger.info("Database initialised")
+        logger.info("Database initialised (Postgres)")
 
     # ------------------------------------------------------------------ #
     # ACCOUNT
@@ -176,30 +199,30 @@ class DatabaseManager:
 
     def get_account(self, mode: str = "PAPER") -> Optional[Dict]:
         with self.get_cursor() as c:
-            c.execute("SELECT * FROM account WHERE mode=?", (mode,))
+            c.execute("SELECT * FROM account WHERE mode=%s", (mode,))
             row = c.fetchone()
             return dict(row) if row else None
 
     def update_account(self, mode: str = "PAPER", **kwargs):
         if not kwargs:
             return
-        fields = ", ".join(f"{k}=?" for k in kwargs)
+        fields = ", ".join(f"{k}=%s" for k in kwargs)
         kwargs["updated_at"] = datetime.now().isoformat()
-        fields += ", updated_at=?"
+        fields += ", updated_at=%s"
         values = list(kwargs.values())
         with self.get_cursor() as c:
-            c.execute(f"UPDATE account SET {fields} WHERE mode=?", values + [mode])
+            c.execute(f"UPDATE account SET {fields} WHERE mode=%s", values + [mode])
 
     def is_trading_enabled(self, mode: str = "PAPER") -> bool:
         with self.get_cursor() as c:
-            c.execute("SELECT trading_enabled FROM account WHERE mode=?", (mode,))
+            c.execute("SELECT trading_enabled FROM account WHERE mode=%s", (mode,))
             row = c.fetchone()
             return bool(row["trading_enabled"]) if row and row["trading_enabled"] is not None else True
 
     def set_trading_enabled(self, enabled: bool, mode: str = "PAPER", reason: str = ""):
         with self.get_cursor() as c:
             c.execute(
-                "UPDATE account SET trading_enabled=?, kill_switch_reason=?, updated_at=? WHERE mode=?",
+                "UPDATE account SET trading_enabled=%s, kill_switch_reason=%s, updated_at=%s WHERE mode=%s",
                 (1 if enabled else 0, reason, datetime.now().isoformat(), mode)
             )
 
@@ -209,7 +232,7 @@ class DatabaseManager:
         attribute), so a dip after a restart is measured against the real
         historical peak, not against INITIAL_CAPITAL."""
         with self.get_cursor() as c:
-            c.execute("SELECT peak_capital, initial_capital FROM account WHERE mode=?", (mode,))
+            c.execute("SELECT peak_capital, initial_capital FROM account WHERE mode=%s", (mode,))
             row = c.fetchone()
             if not row:
                 return 0.0
@@ -218,7 +241,7 @@ class DatabaseManager:
     def update_peak_capital(self, peak: float, mode: str = "PAPER"):
         with self.get_cursor() as c:
             c.execute(
-                "UPDATE account SET peak_capital=?, updated_at=? WHERE mode=?",
+                "UPDATE account SET peak_capital=%s, updated_at=%s WHERE mode=%s",
                 (peak, datetime.now().isoformat(), mode)
             )
 
@@ -239,7 +262,7 @@ class DatabaseManager:
                     (id, mode, symbol, action, entry_price, quantity,
                      stop_loss, take_profit, entry_charges, status,
                      entry_time, atr, adx, confluence_score)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'OPEN', %s, %s, %s, %s)
             """, (pos_id, mode, symbol, action, entry_price, quantity,
                   stop_loss, take_profit, entry_charges, now,
                   atr, adx, confluence_score))
@@ -252,10 +275,10 @@ class DatabaseManager:
         with self.get_cursor() as c:
             c.execute("""
                 UPDATE positions
-                SET status='CLOSED', exit_price=?, exit_time=?,
-                    exit_reason=?, pnl=?, exit_charges=?,
-                    total_charges=entry_charges+?
-                WHERE id=?
+                SET status='CLOSED', exit_price=%s, exit_time=%s,
+                    exit_reason=%s, pnl=%s, exit_charges=%s,
+                    total_charges=entry_charges+%s
+                WHERE id=%s
             """, (exit_price, now, exit_reason, pnl,
                   exit_charges, exit_charges, pos_id))
 
@@ -263,14 +286,14 @@ class DatabaseManager:
         with self.get_cursor() as c:
             c.execute("""
                 SELECT * FROM positions
-                WHERE mode=? AND status='OPEN'
+                WHERE mode=%s AND status='OPEN'
                 ORDER BY entry_time DESC
             """, (mode,))
             return [dict(r) for r in c.fetchall()]
 
     def get_position_by_id(self, pos_id: str) -> Optional[Dict]:
         with self.get_cursor() as c:
-            c.execute("SELECT * FROM positions WHERE id=?", (pos_id,))
+            c.execute("SELECT * FROM positions WHERE id=%s", (pos_id,))
             row = c.fetchone()
             return dict(row) if row else None
 
@@ -278,7 +301,7 @@ class DatabaseManager:
         with self.get_cursor() as c:
             c.execute("""
                 SELECT * FROM positions
-                WHERE symbol=? AND mode=? AND status='OPEN'
+                WHERE symbol=%s AND mode=%s AND status='OPEN'
                 ORDER BY entry_time DESC LIMIT 1
             """, (symbol, mode))
             row = c.fetchone()
@@ -290,14 +313,14 @@ class DatabaseManager:
             if status:
                 c.execute("""
                     SELECT * FROM positions
-                    WHERE mode=? AND status=?
-                    ORDER BY entry_time DESC LIMIT ?
+                    WHERE mode=%s AND status=%s
+                    ORDER BY entry_time DESC LIMIT %s
                 """, (mode, status.upper(), limit))
             else:
                 c.execute("""
                     SELECT * FROM positions
-                    WHERE mode=?
-                    ORDER BY entry_time DESC LIMIT ?
+                    WHERE mode=%s
+                    ORDER BY entry_time DESC LIMIT %s
                 """, (mode, limit))
             return [dict(r) for r in c.fetchall()]
 
@@ -306,8 +329,8 @@ class DatabaseManager:
         with self.get_cursor() as c:
             c.execute("""
                 UPDATE positions
-                SET current_price=?, unrealized_pnl=?
-                WHERE id=?
+                SET current_price=%s, unrealized_pnl=%s
+                WHERE id=%s
             """, (current_price, unrealized_pnl, pos_id))
 
     # ------------------------------------------------------------------ #
@@ -328,7 +351,7 @@ class DatabaseManager:
                     (id, mode, underlying, option_symbol, option_type,
                      strike, expiry, premium, quantity, stop_loss,
                      take_profit, entry_charges, status, entry_time)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'OPEN', %s)
             """, (pos_id, mode, underlying, option_symbol, option_type,
                   strike, expiry, premium, quantity, stop_loss,
                   take_profit, entry_charges, now))
@@ -341,10 +364,10 @@ class DatabaseManager:
         with self.get_cursor() as c:
             c.execute("""
                 UPDATE option_positions
-                SET status='CLOSED', exit_premium=?, exit_time=?,
-                    exit_reason=?, pnl=?, exit_charges=?,
-                    total_charges=entry_charges+?
-                WHERE id=?
+                SET status='CLOSED', exit_premium=%s, exit_time=%s,
+                    exit_reason=%s, pnl=%s, exit_charges=%s,
+                    total_charges=entry_charges+%s
+                WHERE id=%s
             """, (exit_premium, now, exit_reason, pnl,
                   exit_charges, exit_charges, pos_id))
 
@@ -352,7 +375,7 @@ class DatabaseManager:
         with self.get_cursor() as c:
             c.execute("""
                 SELECT * FROM option_positions
-                WHERE mode=? AND status='OPEN'
+                WHERE mode=%s AND status='OPEN'
                 ORDER BY entry_time DESC
             """, (mode,))
             return [dict(r) for r in c.fetchall()]
@@ -362,7 +385,7 @@ class DatabaseManager:
         with self.get_cursor() as c:
             c.execute("""
                 SELECT * FROM option_positions
-                WHERE option_symbol=? AND mode=? AND status='OPEN'
+                WHERE option_symbol=%s AND mode=%s AND status='OPEN'
                 ORDER BY entry_time DESC LIMIT 1
             """, (option_symbol, mode))
             row = c.fetchone()
@@ -376,14 +399,14 @@ class DatabaseManager:
             if status:
                 c.execute("""
                     SELECT * FROM option_positions
-                    WHERE mode=? AND status=?
-                    ORDER BY entry_time DESC LIMIT ?
+                    WHERE mode=%s AND status=%s
+                    ORDER BY entry_time DESC LIMIT %s
                 """, (mode, status.upper(), limit))
             else:
                 c.execute("""
                     SELECT * FROM option_positions
-                    WHERE mode=?
-                    ORDER BY entry_time DESC LIMIT ?
+                    WHERE mode=%s
+                    ORDER BY entry_time DESC LIMIT %s
                 """, (mode, limit))
             return [dict(r) for r in c.fetchall()]
 
@@ -396,13 +419,11 @@ class DatabaseManager:
         best_trade/worst_trade reflect option trades too, instead of
         always showing zero for an options-only strategy.
 
-        FIX (net-of-charges bug): the `pnl` column stores GROSS pnl per
-        trade (charges are tracked separately in `total_charges`). Every
-        aggregate below now subtracts `total_charges` per-row before
-        summing/averaging/min/max, so total_pnl/best_trade/worst_trade/
-        avg_win/avg_loss/profit_factor all reflect real net P&L and line
-        up with account.total_pnl and current_capital movement, instead
-        of silently reporting pre-charges figures.
+        Net-of-charges fix: `pnl` stores GROSS pnl per trade (charges are
+        tracked separately in `total_charges`). Every aggregate here
+        subtracts total_charges per-row before summing/averaging/min/max,
+        so figures line up with account.total_pnl / current_capital
+        movement instead of reporting pre-charges numbers.
         """
         with self.get_cursor() as c:
             c.execute("""
@@ -421,13 +442,13 @@ class DatabaseManager:
                     SELECT
                         pnl - total_charges as net_pnl,
                         total_charges
-                    FROM positions WHERE mode=? AND status='CLOSED'
+                    FROM positions WHERE mode=%s AND status='CLOSED'
                     UNION ALL
                     SELECT
                         pnl - total_charges as net_pnl,
                         total_charges
-                    FROM option_positions WHERE mode=? AND status='CLOSED'
-                )
+                    FROM option_positions WHERE mode=%s AND status='CLOSED'
+                ) t
             """, (mode, mode))
             row = dict(c.fetchone())
             total = row["total_trades"] or 0
@@ -442,7 +463,7 @@ class DatabaseManager:
         with self.get_cursor() as c:
             c.execute("""
                 SELECT pnl - total_charges as net_pnl FROM positions
-                WHERE mode=? AND status='CLOSED'
+                WHERE mode=%s AND status='CLOSED'
                 ORDER BY exit_time DESC LIMIT 20
             """, (mode,))
             rows = c.fetchall()
@@ -458,24 +479,28 @@ class DatabaseManager:
         """Unions positions + option_positions so risk management /
         circuit breakers actually see option P&L for the day.
 
-        FIX (net-of-charges bug): previously summed the raw `pnl` column,
-        which is GROSS P&L per trade. That under-reported real daily loss
-        by the day's total charges (e.g. -13.81 reported vs -153.65 real
-        on 2026-07-07), which meant the MAX_DAILY_LOSS circuit breaker in
-        risk_manager.py was checking a smaller number than the account's
-        actual daily drawdown. Now sums (pnl - total_charges) per row so
-        it matches current_capital movement for the day.
+        Net-of-charges fix: sums (pnl - total_charges) per row so this
+        matches current_capital movement for the day, instead of the old
+        gross-only SUM(pnl) which under-reported real daily loss by the
+        day's total charges.
+
+        entry_time/exit_time are stored as ISO-format TEXT (via
+        datetime.now().isoformat()), so the date comparison casts to
+        timestamp before taking the date, since Postgres doesn't implicitly
+        cast a text column for DATE().
         """
         today = datetime.now().strftime("%Y-%m-%d")
         with self.get_cursor() as c:
             c.execute("""
                 SELECT COALESCE(SUM(pnl - total_charges), 0) as daily_pnl FROM (
                     SELECT pnl, total_charges FROM positions
-                    WHERE mode=? AND status='CLOSED' AND DATE(exit_time)=?
+                    WHERE mode=%s AND status='CLOSED'
+                      AND DATE(exit_time::timestamp)=%s
                     UNION ALL
                     SELECT pnl, total_charges FROM option_positions
-                    WHERE mode=? AND status='CLOSED' AND DATE(exit_time)=?
-                )
+                    WHERE mode=%s AND status='CLOSED'
+                      AND DATE(exit_time::timestamp)=%s
+                ) t
             """, (mode, today, mode, today))
             return c.fetchone()["daily_pnl"] or 0.0
 
@@ -485,11 +510,11 @@ class DatabaseManager:
         with self.get_cursor() as c:
             c.execute("""
                 SELECT COUNT(*) as cnt FROM (
-                    SELECT id FROM positions WHERE mode=? AND DATE(entry_time)=?
+                    SELECT id FROM positions
+                    WHERE mode=%s AND DATE(entry_time::timestamp)=%s
                     UNION ALL
-                    SELECT id FROM option_positions WHERE mode=? AND DATE(entry_time)=?
-                )
+                    SELECT id FROM option_positions
+                    WHERE mode=%s AND DATE(entry_time::timestamp)=%s
+                ) t
             """, (mode, today, mode, today))
             return c.fetchone()["cnt"] or 0
-
-            

@@ -28,7 +28,7 @@ REQUIRED_TEMPLATES = [
 REQUIRED_DIRS = ["templates","static","static/css","static/js"]
 REQUIRED_PACKAGES = [
     "flask","flask_cors","yfinance","pandas","numpy",
-    "requests","telebot","apscheduler","pytz","dotenv","ta"
+    "requests","telebot","apscheduler","pytz","dotenv","ta","psycopg2"
 ]
 
 ok  = lambda m: print(f"{Fore.GREEN}  OK  {m}")
@@ -68,12 +68,15 @@ def main():
     if Path(".env").exists():
         from dotenv import load_dotenv
         load_dotenv()
-        for var in ["SECRET_KEY","WEBHOOK_SECRET","TELEGRAM_BOT_TOKEN","TELEGRAM_CHAT_ID"]:
+        for var in ["SECRET_KEY","WEBHOOK_SECRET","TELEGRAM_BOT_TOKEN","TELEGRAM_CHAT_ID","DATABASE_URL"]:
             val = os.getenv(var)
             if val:
                 ok(f"{var} = {val[:6]}***")
             else:
-                err(f"{var}  [NOT SET]")
+                if var == "DATABASE_URL":
+                    err(f"{var}  [NOT SET - data will NOT survive a Render restart/redeploy]")
+                else:
+                    err(f"{var}  [NOT SET]")
                 all_pass = False
     else:
         err(".env file missing")

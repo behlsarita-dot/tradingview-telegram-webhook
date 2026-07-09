@@ -70,7 +70,19 @@ TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
 TELEGRAM_TIMEOUT = int(os.getenv('TELEGRAM_TIMEOUT', 10))
 
 # DATABASE
+# DATABASE_URL is the Postgres connection string (e.g. from Render Postgres,
+# Neon, or Supabase). When set, database.py uses Postgres and ignores DB_FILE
+# entirely. DB_FILE is kept only as a legacy fallback for local SQLite dev/
+# testing without a Postgres instance configured.
+DATABASE_URL = os.getenv('DATABASE_URL', '')
 DB_FILE = os.getenv('DB_FILE', 'trading_bot.db')
+
+if not DATABASE_URL:
+    logging.warning(
+        "DATABASE_URL not set - falling back to local SQLite (DB_FILE). "
+        "On Render this data does NOT survive restarts/deploys unless DB_FILE "
+        "points at a mounted persistent disk. Set DATABASE_URL for durable storage."
+    )
 
 # BACKUP
 BACKUP_DIR = os.getenv('BACKUP_DIR', 'backups')
@@ -145,6 +157,8 @@ def validate_config():
         warnings.append("TELEGRAM_BOT_TOKEN not set - Telegram disabled")
     if not TELEGRAM_CHAT_ID:
         warnings.append("TELEGRAM_CHAT_ID not set - Telegram disabled")
+    if not DATABASE_URL:
+        warnings.append("DATABASE_URL not set - using ephemeral local SQLite, data will NOT survive a Render restart/redeploy")
     if DRAWDOWN_REDUCTION_START >= MAX_DRAWDOWN_PCT:
         warnings.append("DRAWDOWN_REDUCTION_START must be less than MAX_DRAWDOWN_PCT")
     for w in warnings:
