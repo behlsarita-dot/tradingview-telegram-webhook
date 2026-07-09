@@ -1,58 +1,60 @@
 ﻿#!/usr/bin/env python3
 """
 Database Manager - Paper Trading System v7.0
-Postgres-backed (psycopg2). Public method signatures are unchanged from the
-previous SQLite version, so risk_manager.py, portfolio.py, app.py, and
-signal_analyzer.py require no changes.
+Postgres (Neon) version - replaces the SQLite implementation.
+
+Why this exists: the SQLite file was living on Render's ephemeral
+container filesystem (no persistent disk attached), so every deploy
+wiped current_capital, trade history, and peak_capital back to
+INITIAL_CAPITAL - confirmed happening live on 2026-07-09. Postgres on
+Neon lives outside the container entirely, so it survives deploys,
+restarts, and container swaps.
+
+All public method signatures are unchanged from the SQLite version, so
+app.py, portfolio.py, and risk_manager.py require NO changes - they
+call db.get_account(), db.close_option_position(), etc. exactly as
+before.
+
+Requires: psycopg2-binary (add to requirements.txt)
+Requires env var: DATABASE_URL - the Neon connection string, e.g.
+    postgresql://user:password@ep-xxxx.region.aws.neon.tech/dbname?sslmode=require
 """
 
+import os
 import logging
 import uuid
 from contextlib import contextmanager
 from datetime import datetime
 from typing import Optional, List, Dict
-from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 import psycopg2
 import psycopg2.extras
 
-from config import DATABASE_URL, INITIAL_CAPITAL, TRADING_MODE
+from config import INITIAL_CAPITAL, TRADING_MODE
 
 logger = logging.getLogger(__name__)
 
-
-def _ensure_sslmode(database_url: str) -> str:
-    """Force sslmode=require onto the connection string if it isn't already
-    specified. Neon, Render Postgres, and Supabase all require/expect SSL,
-    but a hand-pasted connection string (e.g. copied without the query
-    string, or from a source that formats it differently) could omit it,
-    which either fails to connect or - worse - silently connects without
-    encryption if the provider allows a fallback. This makes the safe
-    behaviour the default regardless of what was pasted in."""
-    parsed = urlparse(database_url)
-    query = parse_qs(parsed.query)
-    if "sslmode" not in query:
-        query["sslmode"] = ["require"]
-        new_query = urlencode(query, doseq=True)
-        parsed = parsed._replace(query=new_query)
-        return urlunparse(parsed)
-    return database_url
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
 
 class DatabaseManager:
-    def __init__(self, database_url: str = DATABASE_URL):
-        if not database_url:
+    def __init__(self, db_url: str = DATABASE_URL):
+        if not db_url:
             raise RuntimeError(
-                "DATABASE_URL is not set. Configure a Postgres connection "
-                "string (Render Postgres, Neon, Supabase, etc.) in the "
-                "environment before starting the app."
+                "DATABASE_URL is not set. Add it as an env var on Render "
+                "with your Neon connection string (include ?sslmode=require)."
             )
-        self.database_url = _ensure_sslmode(database_url)
+        self.db_url = db_url
         self._init_db()
 
     @contextmanager
     def get_cursor(self):
-        conn = psycopg2.connect(self.database_url, connect_timeout=10)
+        # A fresh connection per call (matches the original SQLite
+        # pattern of one connection per operation). This is deliberately
+        # NOT pooled - Neon's free tier scales compute to zero after ~5
+        # min idle, so a short-lived connection per request plays nicely
+        # with that rather than fighting it with a long-lived pool.
+        conn = psycopg2.connect(self.db_url, sslmode="require")
         cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         try:
             yield cursor
@@ -162,8 +164,8 @@ class DatabaseManager:
                 )
             """)
 
-            # Postgres supports IF NOT EXISTS on ADD COLUMN directly (9.6+),
-            # so no need for the old PRAGMA table_info() introspection dance.
+            # Postgres supports ADD COLUMN IF NOT EXISTS directly, so no
+            # need for the old SQLite PRAGMA table_info() + manual check.
             c.execute("ALTER TABLE account ADD COLUMN IF NOT EXISTS trading_enabled INTEGER DEFAULT 1")
             c.execute("ALTER TABLE account ADD COLUMN IF NOT EXISTS kill_switch_reason TEXT")
             c.execute("ALTER TABLE account ADD COLUMN IF NOT EXISTS peak_capital REAL")
@@ -181,17 +183,13 @@ class DatabaseManager:
                 """, ("PAPER", INITIAL_CAPITAL, INITIAL_CAPITAL, INITIAL_CAPITAL, now, now))
                 logger.info(f"Paper account initialised with Rs.{INITIAL_CAPITAL:,.2f}")
 
-            # Backfill peak_capital for existing rows created before this
-            # column existed (or where it's still null) — start it at
-            # whichever is larger of current_capital or initial_capital so
-            # we never silently understate an already-elevated peak.
             c.execute("""
                 UPDATE account
                 SET peak_capital = GREATEST(current_capital, initial_capital)
                 WHERE peak_capital IS NULL
             """)
 
-        logger.info("Database initialised (Postgres)")
+        logger.info("Database initialised (Postgres/Neon)")
 
     # ------------------------------------------------------------------ #
     # ACCOUNT
@@ -227,10 +225,6 @@ class DatabaseManager:
             )
 
     def get_peak_capital(self, mode: str = "PAPER") -> float:
-        """Persisted high-water mark for capital, used for drawdown/circuit
-        breaker calculations. Survives restarts (unlike an in-memory
-        attribute), so a dip after a restart is measured against the real
-        historical peak, not against INITIAL_CAPITAL."""
         with self.get_cursor() as c:
             c.execute("SELECT peak_capital, initial_capital FROM account WHERE mode=%s", (mode,))
             row = c.fetchone()
@@ -393,8 +387,6 @@ class DatabaseManager:
 
     def get_all_option_positions(self, mode: str = "PAPER",
                                  status: str = None, limit: int = 50) -> List[Dict]:
-        """Lists option trades (open, closed, or both). Fixes BOT-05:
-        previously there was no way to see closed option trade history at all."""
         with self.get_cursor() as c:
             if status:
                 c.execute("""
@@ -415,16 +407,6 @@ class DatabaseManager:
     # ------------------------------------------------------------------ #
 
     def get_trade_stats(self, mode: str = "PAPER") -> Dict:
-        """Unions positions + option_positions so win_rate/profit_factor/
-        best_trade/worst_trade reflect option trades too, instead of
-        always showing zero for an options-only strategy.
-
-        Net-of-charges fix: `pnl` stores GROSS pnl per trade (charges are
-        tracked separately in `total_charges`). Every aggregate here
-        subtracts total_charges per-row before summing/averaging/min/max,
-        so figures line up with account.total_pnl / current_capital
-        movement instead of reporting pre-charges numbers.
-        """
         with self.get_cursor() as c:
             c.execute("""
                 SELECT
@@ -476,45 +458,29 @@ class DatabaseManager:
             return count
 
     def get_daily_pnl(self, mode: str = "PAPER") -> float:
-        """Unions positions + option_positions so risk management /
-        circuit breakers actually see option P&L for the day.
-
-        Net-of-charges fix: sums (pnl - total_charges) per row so this
-        matches current_capital movement for the day, instead of the old
-        gross-only SUM(pnl) which under-reported real daily loss by the
-        day's total charges.
-
-        entry_time/exit_time are stored as ISO-format TEXT (via
-        datetime.now().isoformat()), so the date comparison casts to
-        timestamp before taking the date, since Postgres doesn't implicitly
-        cast a text column for DATE().
-        """
         today = datetime.now().strftime("%Y-%m-%d")
         with self.get_cursor() as c:
             c.execute("""
                 SELECT COALESCE(SUM(pnl - total_charges), 0) as daily_pnl FROM (
                     SELECT pnl, total_charges FROM positions
                     WHERE mode=%s AND status='CLOSED'
-                      AND DATE(exit_time::timestamp)=%s
+                        AND exit_time IS NOT NULL AND DATE(exit_time::timestamp)=%s
                     UNION ALL
                     SELECT pnl, total_charges FROM option_positions
                     WHERE mode=%s AND status='CLOSED'
-                      AND DATE(exit_time::timestamp)=%s
+                        AND exit_time IS NOT NULL AND DATE(exit_time::timestamp)=%s
                 ) t
             """, (mode, today, mode, today))
             return c.fetchone()["daily_pnl"] or 0.0
 
     def get_trades_today(self, mode: str = "PAPER") -> int:
-        """Unions positions + option_positions."""
         today = datetime.now().strftime("%Y-%m-%d")
         with self.get_cursor() as c:
             c.execute("""
                 SELECT COUNT(*) as cnt FROM (
-                    SELECT id FROM positions
-                    WHERE mode=%s AND DATE(entry_time::timestamp)=%s
+                    SELECT id FROM positions WHERE mode=%s AND DATE(entry_time::timestamp)=%s
                     UNION ALL
-                    SELECT id FROM option_positions
-                    WHERE mode=%s AND DATE(entry_time::timestamp)=%s
+                    SELECT id FROM option_positions WHERE mode=%s AND DATE(entry_time::timestamp)=%s
                 ) t
             """, (mode, today, mode, today))
             return c.fetchone()["cnt"] or 0
