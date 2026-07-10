@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """Webhook Tester v2.0 - Paper Trading System v7.0"""
 
 import os, json, time, requests
@@ -15,7 +15,7 @@ if not WEBHOOK_SECRET:
 def post(payload):
     try:
         r = requests.post(f"{BASE_URL}/api/webhook", json=payload,
-                          headers={"Content-Type": "application/json"}, timeout=10)
+                          headers={"Content-Type": "application/json"}, timeout=25)
         return r.json()
     except Exception as e:
         return {"success": False, "error": str(e)}

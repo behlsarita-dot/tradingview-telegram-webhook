@@ -32,18 +32,30 @@ class RiskManager:
         if not ENABLE_RISK_MANAGEMENT:
             return True, {"message": "Risk management disabled"}
 
-        account = self.db.get_account(mode)
+        # FIX (2026-07-10): previously this method made ~8 separate DB
+        # calls (get_account, is_trading_enabled, get_peak_capital,
+        # get_daily_pnl, get_consecutive_losses, get_open_positions,
+        # get_open_option_positions, get_trades_today), each opening a
+        # fresh unpooled connection to Neon. That consistently made
+        # BUY/entry requests take far longer than EXIT requests (which
+        # only need 1-2 connections), to the point of exceeding client
+        # timeouts even though the request eventually succeeded.
+        # get_validation_snapshot() now fetches everything in ONE
+        # connection instead.
+        snap = self.db.get_validation_snapshot(mode)
+        account = snap["account"]
         if not account:
             return False, {"message": "Account not found"}
 
         # Kill switch check — blocks all new entries
-        if not self.db.is_trading_enabled(mode):
+        trading_enabled = bool(account.get("trading_enabled", 1))
+        if not trading_enabled:
             reason = account.get("kill_switch_reason") or "Trading manually halted"
             return False, {"message": f"Kill switch active: {reason}", "circuit_breaker": True}
 
         capital = account["current_capital"]
 
-        can, reason = self._check_circuit_breakers(account, mode)
+        can, reason = self._check_circuit_breakers(account, snap, mode)
         if not can:
             return False, {"message": reason, "circuit_breaker": True}
 
@@ -52,13 +64,11 @@ class RiskManager:
         # checks, since only get_open_positions() (equity table) was
         # consulted. MAX_OPEN_POSITIONS could be silently exceeded, and
         # portfolio heat would read near-zero with several options open.
-        open_pos = self.db.get_open_positions(mode)
-        open_opts = self.db.get_open_option_positions(mode)
-        all_open = open_pos + open_opts
+        all_open = snap["open_positions"] + snap["open_option_positions"]
         if len(all_open) >= MAX_OPEN_POSITIONS:
             return False, {"message": f"Max open positions reached ({MAX_OPEN_POSITIONS})"}
 
-        trades_today = self.db.get_trades_today(mode)
+        trades_today = snap["trades_today"]
         if trades_today >= MAX_TRADES_PER_DAY:
             return False, {"message": f"Max trades per day reached ({MAX_TRADES_PER_DAY})"}
 
@@ -84,18 +94,28 @@ class RiskManager:
             "open_positions": len(all_open)
         }
 
-    def _check_circuit_breakers(self, account: Dict, mode: str) -> Tuple[bool, str]:
+    def _check_circuit_breakers(self, account: Dict, snap: Dict = None,
+                                 mode: str = "PAPER") -> Tuple[bool, str]:
         capital = account["current_capital"]
-        drawdown = self._calculate_drawdown(capital, mode)
+
+        # get_risk_report() still calls this without a snapshot — fall
+        # back to the original individual-query path in that case so its
+        # behavior and connection count are unchanged there.
+        if snap is None:
+            drawdown = self._calculate_drawdown(capital, mode)
+            daily_pnl = self.db.get_daily_pnl(mode)
+            consec = self.db.get_consecutive_losses(mode)
+        else:
+            drawdown = self._calculate_drawdown_from_account(capital, account, mode)
+            daily_pnl = snap["daily_pnl"]
+            consec = snap["consecutive_losses"]
 
         if drawdown >= MAX_DRAWDOWN_PCT:
             return False, f"Max drawdown {drawdown:.1f}% exceeded ({MAX_DRAWDOWN_PCT}%)"
 
-        daily_pnl = self.db.get_daily_pnl(mode)
         if daily_pnl <= -abs(MAX_DAILY_LOSS):
             return False, f"Daily loss limit Rs.{MAX_DAILY_LOSS:,.0f} reached"
 
-        consec = self.db.get_consecutive_losses(mode)
         if consec >= MAX_CONSECUTIVE_LOSSES:
             return False, f"{consec} consecutive losses (limit {MAX_CONSECUTIVE_LOSSES})"
 
@@ -107,8 +127,29 @@ class RiskManager:
         attribute on this instance, so every process restart (which happens
         often on Render with the current SQLite-in-/tmp setup) silently
         reset it back to INITIAL_CAPITAL — understating real drawdown and
-        weakening the circuit breaker right when it mattered most."""
+        weakening the circuit breaker right when it mattered most.
+
+        Still used directly by get_risk_report(), calculate_position_size(),
+        and _size_multiplier() — those call sites don't have a snapshot
+        available, so they keep using this standalone version."""
         peak = self.db.get_peak_capital(mode)
+        if current_capital > peak:
+            peak = current_capital
+            self.db.update_peak_capital(peak, mode)
+        if peak == 0:
+            return 0.0
+        return ((peak - current_capital) / peak) * 100
+
+    def _calculate_drawdown_from_account(self, current_capital: float,
+                                          account: Dict, mode: str = "PAPER") -> float:
+        """Same logic as _calculate_drawdown(), but reuses the account
+        row already fetched in get_validation_snapshot() instead of a
+        separate get_peak_capital() connection. Still writes back via
+        update_peak_capital() on a new high, same as before — only the
+        read is saved, not the occasional write."""
+        peak = account.get("peak_capital")
+        if peak is None:
+            peak = account.get("initial_capital", current_capital)
         if current_capital > peak:
             peak = current_capital
             self.db.update_peak_capital(peak, mode)
@@ -203,7 +244,7 @@ class RiskManager:
         multiplier = self._size_multiplier(capital, mode)
         trading_enabled = self.db.is_trading_enabled(mode)
 
-        can_trade, cb_reason = self._check_circuit_breakers(account, mode)
+        can_trade, cb_reason = self._check_circuit_breakers(account, None, mode)
 
         # Kill switch overrides everything
         if not trading_enabled:
@@ -255,5 +296,3 @@ class RiskManager:
 
 def create_risk_manager(db, initial_capital: float = INITIAL_CAPITAL) -> RiskManager:
     return RiskManager(db, initial_capital)
-
-    

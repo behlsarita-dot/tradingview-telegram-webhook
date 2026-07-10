@@ -240,6 +240,94 @@ class DatabaseManager:
             )
 
     # ------------------------------------------------------------------ #
+    # VALIDATION SNAPSHOT — single connection for validate_new_trade()
+    # ------------------------------------------------------------------ #
+
+    def get_validation_snapshot(self, mode: str = "PAPER") -> Dict:
+        """Fetches everything RiskManager.validate_new_trade() needs in
+        ONE connection instead of ~8 separate ones (get_account,
+        is_trading_enabled, get_peak_capital, get_daily_pnl,
+        get_consecutive_losses, get_open_positions,
+        get_open_option_positions, get_trades_today). Each connection is
+        a fresh TCP+TLS handshake to Neon (no pooling, by design - see
+        get_cursor() above), so on a cold or lightly-loaded connection
+        those round trips were stacking up and causing BUY/entry requests
+        to consistently take far longer than EXIT requests, which only
+        ever needed 1-2 connections. Confirmed via webhook_tester.py and
+        server logs on 2026-07-10: BUY signals reliably exceeded a 10s
+        client timeout while completing successfully a few seconds later
+        server-side once the connection overhead finished."""
+        today = datetime.now().strftime("%Y-%m-%d")
+        with self.get_cursor() as c:
+            c.execute("SELECT * FROM account WHERE mode=%s", (mode,))
+            account_row = c.fetchone()
+            account = dict(account_row) if account_row else None
+
+            c.execute("""
+                SELECT pnl - total_charges as net_pnl, exit_time FROM (
+                    SELECT pnl, total_charges, exit_time FROM positions
+                    WHERE mode=%s AND status='CLOSED'
+                    UNION ALL
+                    SELECT pnl, total_charges, exit_time FROM option_positions
+                    WHERE mode=%s AND status='CLOSED'
+                ) t
+                ORDER BY exit_time DESC LIMIT 20
+            """, (mode, mode))
+            closed_rows = c.fetchall()
+
+            c.execute("""
+                SELECT COALESCE(SUM(pnl - total_charges), 0) as daily_pnl FROM (
+                    SELECT pnl, total_charges FROM positions
+                    WHERE mode=%s AND status='CLOSED'
+                        AND exit_time IS NOT NULL AND DATE(exit_time::timestamp)=%s
+                    UNION ALL
+                    SELECT pnl, total_charges FROM option_positions
+                    WHERE mode=%s AND status='CLOSED'
+                        AND exit_time IS NOT NULL AND DATE(exit_time::timestamp)=%s
+                ) t
+            """, (mode, today, mode, today))
+            daily_pnl = c.fetchone()["daily_pnl"] or 0.0
+
+            c.execute("""
+                SELECT * FROM positions
+                WHERE mode=%s AND status='OPEN'
+                ORDER BY entry_time DESC
+            """, (mode,))
+            open_positions = [dict(r) for r in c.fetchall()]
+
+            c.execute("""
+                SELECT * FROM option_positions
+                WHERE mode=%s AND status='OPEN'
+                ORDER BY entry_time DESC
+            """, (mode,))
+            open_option_positions = [dict(r) for r in c.fetchall()]
+
+            c.execute("""
+                SELECT COUNT(*) as cnt FROM (
+                    SELECT id FROM positions WHERE mode=%s AND DATE(entry_time::timestamp)=%s
+                    UNION ALL
+                    SELECT id FROM option_positions WHERE mode=%s AND DATE(entry_time::timestamp)=%s
+                ) t
+            """, (mode, today, mode, today))
+            trades_today = c.fetchone()["cnt"] or 0
+
+        consecutive_losses = 0
+        for r in closed_rows:
+            if r["net_pnl"] < 0:
+                consecutive_losses += 1
+            else:
+                break
+
+        return {
+            "account": account,
+            "daily_pnl": daily_pnl,
+            "open_positions": open_positions,
+            "open_option_positions": open_option_positions,
+            "trades_today": trades_today,
+            "consecutive_losses": consecutive_losses,
+        }
+
+    # ------------------------------------------------------------------ #
     # POSITIONS
     # ------------------------------------------------------------------ #
 
@@ -447,7 +535,8 @@ class DatabaseManager:
         # option trades - the only kind the live bot actually places.
         # Now unions both tables and orders by the combined exit_time,
         # matching the pattern already used in get_trade_stats() and
-        # get_daily_pnl().
+        # get_daily_pnl(). Still used standalone by get_risk_report(),
+        # which does not go through get_validation_snapshot().
         with self.get_cursor() as c:
             c.execute("""
                 SELECT pnl - total_charges as net_pnl, exit_time FROM (
@@ -495,5 +584,4 @@ class DatabaseManager:
                 ) t
             """, (mode, today, mode, today))
             return c.fetchone()["cnt"] or 0
-        
         
