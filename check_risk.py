@@ -15,11 +15,11 @@ Run from anywhere (no need to be inside the repo):
 """
 
 import sys
-
+import time  # Add this import
 import requests
 
 BASE_URL = "https://tradingview-telegram-webhook-dpaj.onrender.com"
-REQUEST_TIMEOUT = 15
+REQUEST_TIMEOUT = 45  # Changed from 15 to 45 seconds
 
 
 def fetch(path):
@@ -34,7 +34,10 @@ def fetch(path):
 
 
 def main():
+    # Add a warm-up message
     print("=== Risk Manager State - Live Render Instance ===\n")
+    print("🔥 Warming up server (cold start may take 30-60 seconds)...")
+    
     data = fetch("/api/risk/report")
 
     if not data.get("success", True) and "error" in data:
@@ -44,7 +47,7 @@ def main():
     def line(label, value):
         print(f"  {label:<28} {value}")
 
-    print("-- Circuit Breaker / Kill Switch --")
+    print("\n-- Circuit Breaker / Kill Switch --")
     line("Can trade:", data.get("can_trade"))
     line("Kill switch active:", data.get("kill_switch_active"))
     if data.get("circuit_breaker_active"):
@@ -74,4 +77,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
     

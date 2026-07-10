@@ -442,12 +442,23 @@ class DatabaseManager:
             return row
 
     def get_consecutive_losses(self, mode: str = "PAPER") -> int:
+        # NOTE (fixed 2026-07-10): previously only queried `positions`,
+        # so the circuit breaker was blind to consecutive losses on
+        # option trades - the only kind the live bot actually places.
+        # Now unions both tables and orders by the combined exit_time,
+        # matching the pattern already used in get_trade_stats() and
+        # get_daily_pnl().
         with self.get_cursor() as c:
             c.execute("""
-                SELECT pnl - total_charges as net_pnl FROM positions
-                WHERE mode=%s AND status='CLOSED'
+                SELECT pnl - total_charges as net_pnl, exit_time FROM (
+                    SELECT pnl, total_charges, exit_time FROM positions
+                    WHERE mode=%s AND status='CLOSED'
+                    UNION ALL
+                    SELECT pnl, total_charges, exit_time FROM option_positions
+                    WHERE mode=%s AND status='CLOSED'
+                ) t
                 ORDER BY exit_time DESC LIMIT 20
-            """, (mode,))
+            """, (mode, mode))
             rows = c.fetchall()
             count = 0
             for r in rows:
@@ -484,3 +495,5 @@ class DatabaseManager:
                 ) t
             """, (mode, today, mode, today))
             return c.fetchone()["cnt"] or 0
+        
+        
