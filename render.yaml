@@ -2,7 +2,7 @@ services:
   - type: web
     name: tradingview-telegram-webhook
     env: python
-    pythonVersion: 3.11.9
+    pythonVersion: 3.13.4
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn app:app -c gunicorn.conf.py
     healthCheckPath: /health
