@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """Trade Monitor v1.0 - Paper Trading System v7.0"""
 
 import requests, sys, json

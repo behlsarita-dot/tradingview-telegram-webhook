@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 Custom Exceptions - Paper Trading System v7.0
 """

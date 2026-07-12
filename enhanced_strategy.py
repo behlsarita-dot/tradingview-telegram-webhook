@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 Enhanced Strategy Engine - Paper Trading System v7.0
 Multi-timeframe confluence scoring for NIFTY 50 options.

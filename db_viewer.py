@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """DB Viewer - lists all tables, columns, and first 3 rows (Postgres)"""
 
 import os

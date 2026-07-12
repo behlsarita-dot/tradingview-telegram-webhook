@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 Configuration - Paper Trading System v7.0
 Single source of truth for all settings.

@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 Portfolio Manager - Paper Trading System v7.0
 Handles brokerage charges, P&L calculations, and capital updates.

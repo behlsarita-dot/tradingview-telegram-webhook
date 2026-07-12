@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """Emergency Position Closer - Paper Trading System v7.0"""
 
 import os, requests, json

@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 Database Manager - Paper Trading System v7.0
 Postgres (Neon) version - replaces the SQLite implementation.
