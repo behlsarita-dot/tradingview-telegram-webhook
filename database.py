@@ -170,7 +170,14 @@ class DatabaseManager:
             c.execute("ALTER TABLE account ADD COLUMN IF NOT EXISTS kill_switch_reason TEXT")
             c.execute("ALTER TABLE account ADD COLUMN IF NOT EXISTS peak_capital REAL")
 
-            c.execute("SELECT COUNT(*) as cnt FROM account WHERE mode='PAPER'")
+            # Bootstrap the account row for whatever mode this process is
+            # running as (PAPER by default, but TEST when a local dev
+            # server is isolated from production - see TRADING_MODE in
+            # config.py). Previously hardcoded to 'PAPER', which meant a
+            # TEST-mode server would find no account row on first boot
+            # and every webhook would fail with "Account not found"
+            # instead of cleanly isolating from production data.
+            c.execute("SELECT COUNT(*) as cnt FROM account WHERE mode=%s", (TRADING_MODE,))
             if c.fetchone()["cnt"] == 0:
                 now = datetime.now().isoformat()
                 c.execute("""
@@ -180,8 +187,8 @@ class DatabaseManager:
                          winning_trades, losing_trades, trading_enabled,
                          peak_capital, created_at, updated_at)
                     VALUES (%s, %s, %s, 0, 0, 0, 0, 0, 0, 1, %s, %s, %s)
-                """, ("PAPER", INITIAL_CAPITAL, INITIAL_CAPITAL, INITIAL_CAPITAL, now, now))
-                logger.info(f"Paper account initialised with Rs.{INITIAL_CAPITAL:,.2f}")
+                """, (TRADING_MODE, INITIAL_CAPITAL, INITIAL_CAPITAL, INITIAL_CAPITAL, now, now))
+                logger.info(f"{TRADING_MODE} account initialised with Rs.{INITIAL_CAPITAL:,.2f}")
 
             c.execute("""
                 UPDATE account
@@ -240,6 +247,43 @@ class DatabaseManager:
             )
 
     # ------------------------------------------------------------------ #
+    # SHARED HELPERS
+    # ------------------------------------------------------------------ #
+
+    def _get_recent_closed_trades(self, c, mode: str, limit: int = 20) -> List[Dict]:
+        """Shared by get_validation_snapshot() and get_consecutive_losses()
+        so the two never drift apart again (see 2026-07-10 fix history,
+        where get_consecutive_losses() was originally missing option
+        trades entirely). Takes an already-open cursor `c` so callers
+        control the connection lifecycle - this does NOT open its own
+        get_cursor() block, and must always be called from inside one."""
+        c.execute("""
+            SELECT pnl - total_charges as net_pnl, exit_time FROM (
+                SELECT pnl, total_charges, exit_time FROM positions
+                WHERE mode=%s AND status='CLOSED'
+                UNION ALL
+                SELECT pnl, total_charges, exit_time FROM option_positions
+                WHERE mode=%s AND status='CLOSED'
+            ) t
+            ORDER BY exit_time DESC LIMIT %s
+        """, (mode, mode, limit))
+        return c.fetchall()
+
+    @staticmethod
+    def _count_consecutive_losses(rows: List[Dict]) -> int:
+        """Counts losses from the most recent trade backwards, stopping
+        at the first non-loss. Shared by get_validation_snapshot() and
+        get_consecutive_losses() - keep this as the single source of
+        truth for the "what counts as a loss streak" definition."""
+        count = 0
+        for r in rows:
+            if r["net_pnl"] < 0:
+                count += 1
+            else:
+                break
+        return count
+
+    # ------------------------------------------------------------------ #
     # VALIDATION SNAPSHOT — single connection for validate_new_trade()
     # ------------------------------------------------------------------ #
 
@@ -263,17 +307,7 @@ class DatabaseManager:
             account_row = c.fetchone()
             account = dict(account_row) if account_row else None
 
-            c.execute("""
-                SELECT pnl - total_charges as net_pnl, exit_time FROM (
-                    SELECT pnl, total_charges, exit_time FROM positions
-                    WHERE mode=%s AND status='CLOSED'
-                    UNION ALL
-                    SELECT pnl, total_charges, exit_time FROM option_positions
-                    WHERE mode=%s AND status='CLOSED'
-                ) t
-                ORDER BY exit_time DESC LIMIT 20
-            """, (mode, mode))
-            closed_rows = c.fetchall()
+            closed_rows = self._get_recent_closed_trades(c, mode, limit=20)
 
             c.execute("""
                 SELECT COALESCE(SUM(pnl - total_charges), 0) as daily_pnl FROM (
@@ -311,12 +345,7 @@ class DatabaseManager:
             """, (mode, today, mode, today))
             trades_today = c.fetchone()["cnt"] or 0
 
-        consecutive_losses = 0
-        for r in closed_rows:
-            if r["net_pnl"] < 0:
-                consecutive_losses += 1
-            else:
-                break
+        consecutive_losses = self._count_consecutive_losses(closed_rows)
 
         return {
             "account": account,
@@ -530,32 +559,15 @@ class DatabaseManager:
             return row
 
     def get_consecutive_losses(self, mode: str = "PAPER") -> int:
-        # NOTE (fixed 2026-07-10): previously only queried `positions`,
-        # so the circuit breaker was blind to consecutive losses on
-        # option trades - the only kind the live bot actually places.
-        # Now unions both tables and orders by the combined exit_time,
-        # matching the pattern already used in get_trade_stats() and
-        # get_daily_pnl(). Still used standalone by get_risk_report(),
-        # which does not go through get_validation_snapshot().
+        # Still used standalone by get_risk_report(), which does not go
+        # through get_validation_snapshot(). Delegates to the same
+        # shared helpers get_validation_snapshot() uses, so the two
+        # can never silently drift apart again (see 2026-07-10 fix
+        # history: this used to query `positions` only, missing every
+        # option trade - the only kind the live bot actually places).
         with self.get_cursor() as c:
-            c.execute("""
-                SELECT pnl - total_charges as net_pnl, exit_time FROM (
-                    SELECT pnl, total_charges, exit_time FROM positions
-                    WHERE mode=%s AND status='CLOSED'
-                    UNION ALL
-                    SELECT pnl, total_charges, exit_time FROM option_positions
-                    WHERE mode=%s AND status='CLOSED'
-                ) t
-                ORDER BY exit_time DESC LIMIT 20
-            """, (mode, mode))
-            rows = c.fetchall()
-            count = 0
-            for r in rows:
-                if r["net_pnl"] < 0:
-                    count += 1
-                else:
-                    break
-            return count
+            rows = self._get_recent_closed_trades(c, mode, limit=20)
+        return self._count_consecutive_losses(rows)
 
     def get_daily_pnl(self, mode: str = "PAPER") -> float:
         today = datetime.now().strftime("%Y-%m-%d")

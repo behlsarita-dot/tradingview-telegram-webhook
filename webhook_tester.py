@@ -119,7 +119,21 @@ def test_invalid_action():
 def run_all():
     print(f"\nServer: {BASE_URL}")
     h = health()
-    print(f"Health: {h.get('status', 'unknown')} | Mode: {h.get('mode', '?')}")
+    server_mode = h.get("mode", "?")
+    print(f"Health: {h.get('status', 'unknown')} | Mode: {server_mode}")
+
+    # SAFETY GUARD (added 2026-07-13): this script writes dummy trades.
+    # Running it against a PAPER/LIVE server contaminates real account
+    # data - confirmed happening when a local dev server shared the same
+    # DATABASE_URL as Render. Refuse to proceed unless the server it's
+    # talking to is explicitly running in TEST mode.
+    if server_mode != "TEST":
+        print(f"\n⚠️  ABORTED: server is running in '{server_mode}' mode, not 'TEST'.")
+        print("This script writes dummy trades — running it against PAPER/LIVE")
+        print("will contaminate real account data. Set TRADING_MODE=TEST in the")
+        print("local .env this server was started with, restart it, then retry.")
+        return
+
     results = {
         "Buy Option Signal":  test_buy(),
         "Exit Option Signal": test_exit(),
