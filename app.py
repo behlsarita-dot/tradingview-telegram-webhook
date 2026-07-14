@@ -12,6 +12,7 @@ Features:
 
 import os
 import logging
+import threading
 import time
 from datetime import datetime
 
@@ -615,6 +616,28 @@ def api_close_position(pos_id):
 
 
 # ── Webhook ────────────────────────────────────────────────────────────────
+#
+# FIX (2026-07-14): TradingView cancels a webhook request if the receiving
+# server hasn't responded within ~3 seconds (confirmed via TradingView's own
+# docs: "if a remote server takes longer than three seconds to process a
+# request, the request will be cancelled"). Live logs on 2026-07-14 showed
+# the BUY_OPTION/EXIT_OPTION round trip (risk-validation snapshot query +
+# position insert/update, each a fresh Neon connection - see database.py)
+# taking 4-7 seconds. The trade completed correctly every time (DB, capital,
+# and Telegram all reflected it), but TradingView's own alert log still
+# marked the delivery "failed - request took too long and timed out",
+# because ITS clock had already given up before the response went out.
+#
+# Fix: split the route into (1) fast, DB-free validation that must
+# succeed synchronously - rate limit, JSON parse, webhook secret, action
+# name - and (2) the actual risk-check + DB write + notify, which now runs
+# on a background thread AFTER an immediate 200 is returned. TradingView
+# doesn't read the response body, so this loses nothing on that side.
+# Anything that used to come back as a 400 (risk rejected, position not
+# found) is now reported over Telegram instead, since the HTTP response is
+# already gone by the time that logic runs - notify_circuit_breaker() and
+# the untracked-position alerts already did this; _notify_rejection() below
+# extends the same pattern to ordinary risk-validation rejections.
 
 @app.route("/api/webhook", methods=["POST"])
 def api_webhook():
@@ -639,34 +662,82 @@ def api_webhook():
 
         symbol = payload.get("symbol", "NIFTY").upper()
 
-        if action in ("BUY", "SELL"):
-            return _handle_open(payload, action, symbol)
-        elif action in ("EXIT", "EXIT_LONG", "EXIT_SHORT"):
-            return _handle_exit(payload, symbol)
-        elif action == "BUY_OPTION":
-            return _handle_open_option(payload, symbol)
-        elif action == "EXIT_OPTION":
-            return _handle_exit_option(payload, symbol)
+        # Everything from here on touches the DB and/or the risk manager,
+        # which is exactly the part that was blowing past TradingView's
+        # 3-second budget. Hand it to a background thread and respond now.
+        threading.Thread(
+            target=_process_webhook_action,
+            args=(action, payload, symbol),
+            daemon=True
+        ).start()
 
-        return jsonify({"success": False, "message": f"Unhandled action: {action}"}), 400
+        return jsonify({
+            "success": True,
+            "message": "Signal received - processing",
+            "action":  action,
+            "symbol":  symbol,
+        }), 200
 
     except Exception as e:
         resp, code = handle_exception(e)
         return jsonify(resp), code
 
 
+def _process_webhook_action(action: str, payload: dict, symbol: str):
+    """
+    Runs off-thread, after the webhook response has already been sent.
+    Any exception here can no longer become an HTTP status code TradingView
+    will see, so it's logged and reported via Telegram instead of raised.
+    """
+    try:
+        if action in ("BUY", "SELL"):
+            _handle_open(payload, action, symbol)
+        elif action in ("EXIT", "EXIT_LONG", "EXIT_SHORT"):
+            _handle_exit(payload, symbol)
+        elif action == "BUY_OPTION":
+            _handle_open_option(payload, symbol)
+        elif action == "EXIT_OPTION":
+            _handle_exit_option(payload, symbol)
+        else:
+            logger.warning(f"Unhandled action in background processor: {action}")
+    except Exception as e:
+        logger.error(f"Background webhook processing failed: {action} {symbol}: {e}")
+        send_message(
+            f"⚠️ *Webhook processing error*\n"
+            f"Action: `{action}`\n"
+            f"Symbol: `{symbol}`\n"
+            f"Error: `{e}`\n"
+            f"Time: `{ist_now()}`"
+        )
+
+
+def _notify_rejection(action: str, symbol: str, message: str):
+    """Reports an ordinary risk-validation rejection (not a circuit-breaker
+    trip - those already go through notify_circuit_breaker()) over Telegram.
+    This used to be a 400 response body; now that the response is already
+    sent by the time validation runs, Telegram is the only place this can
+    surface."""
+    logger.warning(f"Signal rejected: {action} {symbol} - {message}")
+    send_message(
+        f"🚫 *Signal rejected*\n"
+        f"Action: `{action}`\n"
+        f"Symbol: `{symbol}`\n"
+        f"Reason: `{message}`\n"
+        f"Time: `{ist_now()}`"
+    )
+
+
 def _handle_open(payload: dict, action: str, symbol: str):
     entry = float(payload.get("price", 0))
     if entry <= 0:
-        return jsonify({"success": False, "message": "Valid price required"}), 400
+        _notify_rejection(action, symbol, "Valid price required")
+        return
 
     # Block new entries at or after 15:00 IST
     now_ist = datetime.now(IST)
     if now_ist.hour >= 15:
-        return jsonify({
-            "success": False,
-            "message": "New entries blocked after 15:00 IST (intraday only)"
-        }), 400
+        _notify_rejection(action, symbol, "New entries blocked after 15:00 IST (intraday only)")
+        return
 
     qty       = int(payload.get("quantity", LOT_SIZE))
     sl        = float(payload.get("sl", 0)) or None
@@ -681,7 +752,9 @@ def _handle_open(payload: dict, action: str, symbol: str):
     if not is_valid:
         if details.get("circuit_breaker"):
             notify_circuit_breaker(details["message"])
-        return jsonify({"success": False, "message": details["message"], "details": details}), 400
+        else:
+            _notify_rejection(action, symbol, details["message"])
+        return
 
     charges = calculate_equity_charges(entry, qty, "BUY")
     pos_id  = db.open_position(
@@ -701,31 +774,20 @@ def _handle_open(payload: dict, action: str, symbol: str):
     notify_trade_open(symbol, action, entry, qty, sl, tp, pos_id, charges)
     logger.info(f"Position opened: {action} {symbol} @ Rs.{entry} qty={qty}")
 
-    return jsonify({
-        "success":     True,
-        "message":     "Position opened",
-        "position_id": pos_id,
-        "symbol":      symbol,
-        "action":      action,
-        "entry_price": entry,
-        "quantity":    qty,
-        "charges":     charges,
-    })
-
 
 def _handle_exit(payload: dict, symbol: str):
     exit_price = float(payload.get("price", 0))
     if exit_price <= 0:
-        return jsonify({"success": False, "message": "Valid exit price required"}), 400
+        _notify_rejection("EXIT", symbol, "Valid exit price required")
+        return
 
     position = db.get_open_position_by_symbol(symbol, TRADING_MODE)
     if not position:
-        # FIX: alert the desync immediately over Telegram instead of only
-        # surfacing it as a 404 that nobody sees until a manual log audit.
-        # This means the Pine chart thinks it's holding a position (or a
-        # duplicate/stale exit alert fired) that the bot's DB has no record
-        # of as OPEN. The 404 response to TradingView is unchanged below —
-        # this only adds visibility.
+        # FIX: alert the desync over Telegram instead of only surfacing it
+        # as a 404 that nobody sees until a manual log audit. This means
+        # the Pine chart thinks it's holding a position (or a duplicate/
+        # stale exit alert fired) that the bot's DB has no record of as
+        # OPEN.
         send_message(
             f"⚠️ *EXIT signal for untracked position*\n"
             f"Symbol: `{symbol}`\n"
@@ -733,7 +795,7 @@ def _handle_exit(payload: dict, symbol: str):
             f"Bot has no open position for this symbol.\n"
             f"Time: `{ist_now()}`"
         )
-        raise PositionNotFoundError(symbol=symbol)
+        return
 
     reason = payload.get("exit_reason", "Signal Exit")
     result = portfolio.apply_trade_close(position, exit_price, reason, TRADING_MODE)
@@ -745,17 +807,6 @@ def _handle_exit(payload: dict, symbol: str):
         reason, result["total_charges"]
     )
     logger.info(f"Position closed: {symbol} @ Rs.{exit_price} pnl=Rs.{result['net_pnl']}")
-
-    return jsonify({
-        "success":     True,
-        "message":     "Position closed",
-        "position_id": position["id"],
-        "exit_price":  exit_price,
-        "pnl":         result["gross_pnl"],
-        "net_pnl":     result["net_pnl"],
-        "charges":     result["total_charges"],
-        "exit_reason": reason,
-    })
 
 
 def _handle_open_option(payload: dict, symbol: str):
@@ -769,7 +820,8 @@ def _handle_open_option(payload: dict, symbol: str):
     tp            = float(payload.get("tp", 0)) or None
 
     if not option_symbol or premium <= 0:
-        return jsonify({"success": False, "message": "option_symbol and premium required"}), 400
+        _notify_rejection("BUY_OPTION", option_symbol or symbol, "option_symbol and premium required")
+        return
 
     # Options risk is measured in premium terms (the Pine script computes
     # sl/tp off the option chart's own close, i.e. premium — not the
@@ -785,7 +837,9 @@ def _handle_open_option(payload: dict, symbol: str):
     if not is_valid:
         if details.get("circuit_breaker"):
             notify_circuit_breaker(details["message"])
-        return jsonify({"success": False, "message": details["message"], "details": details}), 400
+        else:
+            _notify_rejection("BUY_OPTION", option_symbol, details["message"])
+        return
 
     charges = calculate_option_charges(premium, qty, "BUY")
     pos_id  = db.open_option_position(
@@ -807,23 +861,14 @@ def _handle_open_option(payload: dict, symbol: str):
     notify_trade_open(option_symbol, f"BUY {option_type}", premium, qty, sl, tp, pos_id, charges)
     logger.info(f"Option opened: {option_symbol} @ Rs.{premium} qty={qty}")
 
-    return jsonify({
-        "success":       True,
-        "message":       "Option position opened",
-        "position_id":   pos_id,
-        "option_symbol": option_symbol,
-        "premium":       premium,
-        "quantity":      qty,
-        "charges":       charges,
-    })
-
 
 def _handle_exit_option(payload: dict, symbol: str):
     option_symbol = payload.get("option_symbol", "")
     exit_premium  = float(payload.get("premium", 0))
 
     if not option_symbol:
-        return jsonify({"success": False, "message": "option_symbol required for EXIT_OPTION"}), 400
+        _notify_rejection("EXIT_OPTION", symbol, "option_symbol required for EXIT_OPTION")
+        return
 
     position = db.get_open_option_by_symbol(option_symbol, TRADING_MODE)
     if not position:
@@ -834,9 +879,7 @@ def _handle_exit_option(payload: dict, symbol: str):
         # is fire-and-forget). If that entry was ever rejected or dropped,
         # the script still believes it's in a trade and will eventually
         # fire a legitimate-looking EXIT_OPTION for a position the bot
-        # never opened. The bot's 404 here is correct and safe — this just
-        # makes the moment visible instead of discoverable only via a
-        # manual log/CSV audit days later.
+        # never opened.
         send_message(
             f"⚠️ *EXIT signal for untracked position*\n"
             f"Symbol: `{option_symbol}`\n"
@@ -844,7 +887,7 @@ def _handle_exit_option(payload: dict, symbol: str):
             f"Bot has no open position for this symbol — Pine chart and bot DB may be out of sync.\n"
             f"Time: `{ist_now()}`"
         )
-        raise PositionNotFoundError(symbol=option_symbol)
+        return
 
     reason = payload.get("exit_reason", "Signal Exit")
     result = portfolio.apply_trade_close(position, exit_premium, reason, TRADING_MODE)
@@ -855,16 +898,7 @@ def _handle_exit_option(payload: dict, symbol: str):
         position["quantity"], result["gross_pnl"],
         reason, result["total_charges"]
     )
-
-    return jsonify({
-        "success":       True,
-        "message":       "Option position closed",
-        "position_id":   position["id"],
-        "exit_premium":  exit_premium,
-        "pnl":           result["gross_pnl"],
-        "net_pnl":       result["net_pnl"],
-        "charges":       result["total_charges"],
-    })
+    logger.info(f"Option closed: {option_symbol} @ Rs.{exit_premium} pnl=Rs.{result['net_pnl']}")
 
 
 # ── Analysis ───────────────────────────────────────────────────────────────
@@ -1035,5 +1069,4 @@ if __name__ == "__main__":
     logger.info("=" * 60)
     notify_startup(INITIAL_CAPITAL, TRADING_MODE)
     app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
-
     

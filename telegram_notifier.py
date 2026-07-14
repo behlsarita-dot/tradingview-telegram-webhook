@@ -278,4 +278,3 @@ def get_status() -> dict:
 
 def _now() -> str:
     return datetime.now().strftime("%d-%m-%Y %H:%M:%S")
-    

@@ -54,7 +54,16 @@ class DatabaseManager:
         # NOT pooled - Neon's free tier scales compute to zero after ~5
         # min idle, so a short-lived connection per request plays nicely
         # with that rather than fighting it with a long-lived pool.
-        conn = psycopg2.connect(self.db_url, sslmode="require")
+        #
+        # connect_timeout added 2026-07-14: a suspended/slow Neon endpoint
+        # should fail fast and loud (raising here, which app.py's webhook
+        # handler now catches on a background thread and reports over
+        # Telegram) rather than hang indefinitely. This does not fix
+        # TradingView's 3-second webhook timeout on its own - see the
+        # comment above api_webhook() in app.py for the actual fix
+        # (respond to TradingView immediately, do this connection/query
+        # work afterwards on a background thread).
+        conn = psycopg2.connect(self.db_url, sslmode="require", connect_timeout=8)
         cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         try:
             yield cursor
