@@ -12,6 +12,7 @@ Features:
 
 import os
 import logging
+import queue
 import threading
 import time
 from datetime import datetime
@@ -615,6 +616,41 @@ def api_close_position(pos_id):
         return jsonify(resp), code
 
 
+# FIX (2026-07-15): the first version of this used `threading.Thread(...).start()`
+# per request, which fixed the TradingView timeout but introduced a NEW bug:
+# two webhooks for the same symbol arriving close together (e.g. a BUY
+# immediately followed by an EXIT — exactly what webhook_tester.py sends,
+# and exactly what a fast SL/reversal can produce live) are no longer
+# guaranteed to be *processed* in the order they were *received*, because
+# each got its own thread racing independently. Confirmed live: BUY_OPTION
+# acked at 09:13:32, EXIT_OPTION acked at 09:13:34, but the BUY's own DB
+# write didn't land until 09:13:37.932 — so the EXIT's thread ran first,
+# found no open position, silently sent the "untracked position" Telegram
+# alert, and dropped the exit. The original synchronous code never had
+# this problem because Flask's dev server handles one request at a time,
+# so ordering was guaranteed for free.
+#
+# Fix: a single background worker thread pulls jobs off a FIFO queue and
+# processes them strictly one at a time, in arrival order. The webhook
+# route still responds instantly (put() on a queue is effectively
+# instant) — it just no longer risks a same-symbol race.
+_webhook_queue: "queue.Queue" = queue.Queue()
+
+
+def _webhook_worker():
+    while True:
+        action, payload, symbol = _webhook_queue.get()
+        try:
+            _process_webhook_action(action, payload, symbol)
+        except Exception as e:
+            logger.error(f"Unhandled error in webhook worker: {action} {symbol}: {e}")
+        finally:
+            _webhook_queue.task_done()
+
+
+threading.Thread(target=_webhook_worker, daemon=True).start()
+
+
 # ── Webhook ────────────────────────────────────────────────────────────────
 #
 # FIX (2026-07-14): TradingView cancels a webhook request if the receiving
@@ -630,14 +666,15 @@ def api_close_position(pos_id):
 #
 # Fix: split the route into (1) fast, DB-free validation that must
 # succeed synchronously - rate limit, JSON parse, webhook secret, action
-# name - and (2) the actual risk-check + DB write + notify, which now runs
-# on a background thread AFTER an immediate 200 is returned. TradingView
-# doesn't read the response body, so this loses nothing on that side.
-# Anything that used to come back as a 400 (risk rejected, position not
-# found) is now reported over Telegram instead, since the HTTP response is
-# already gone by the time that logic runs - notify_circuit_breaker() and
-# the untracked-position alerts already did this; _notify_rejection() below
-# extends the same pattern to ordinary risk-validation rejections.
+# name - and (2) the actual risk-check + DB write + notify, which is now
+# queued onto the single FIFO worker above and processed AFTER an
+# immediate 200 is returned. TradingView doesn't read the response body,
+# so this loses nothing on that side. Anything that used to come back as
+# a 400 (risk rejected, position not found) is now reported over Telegram
+# instead, since the HTTP response is already gone by the time that logic
+# runs - notify_circuit_breaker() and the untracked-position alerts
+# already did this; _notify_rejection() below extends the same pattern to
+# ordinary risk-validation rejections.
 
 @app.route("/api/webhook", methods=["POST"])
 def api_webhook():
@@ -662,14 +699,11 @@ def api_webhook():
 
         symbol = payload.get("symbol", "NIFTY").upper()
 
-        # Everything from here on touches the DB and/or the risk manager,
-        # which is exactly the part that was blowing past TradingView's
-        # 3-second budget. Hand it to a background thread and respond now.
-        threading.Thread(
-            target=_process_webhook_action,
-            args=(action, payload, symbol),
-            daemon=True
-        ).start()
+        # Queue it (FIFO, single worker — see _webhook_worker above) and
+        # respond immediately. This is what actually fixes the timeout:
+        # everything DB/risk-manager related now happens after the response
+        # has already gone out, but strictly in arrival order.
+        _webhook_queue.put((action, payload, symbol))
 
         return jsonify({
             "success": True,
