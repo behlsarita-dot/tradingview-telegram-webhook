@@ -112,10 +112,30 @@ class PortfolioManager:
         }
 
     def apply_trade_close(self, position: Dict, exit_price: float,
-                          exit_reason: str, mode: str = "PAPER") -> Dict:
+                          exit_reason: str, mode: str = "PAPER") -> Optional[Dict]:
         """
         Close a position. Works for both equity and options.
         Options use 'premium' as entry price, equity uses 'entry_price'.
+
+        Returns None if the position was already CLOSED by the time the
+        DB write ran — i.e. this call lost a race against another
+        worker/retry closing the same position first (see
+        DatabaseManager.close_position()/close_option_position(), which
+        only flip status when it's still 'OPEN' and report back via
+        rowcount whether they actually did it).
+
+        NEW (2026-07-20): this check exists specifically so that a
+        duplicate EXIT/EXIT_OPTION webhook (recovered-but-not-actually-
+        dead row, or a genuine retry) can never double-apply P&L to
+        current_capital. Previously this method assumed its own
+        db.close_position() call always succeeded and unconditionally
+        adjusted the account afterward — safe when there was only ever
+        one attempt, not safe once recover_stuck_webhooks() and multiple
+        gunicorn workers made a second attempt possible. Callers
+        (app.py: _handle_exit, _handle_exit_option, close_all_positions_eod,
+        api_close_position) must check for None and skip
+        notify_trade_close() / treat it as "already handled", not as an
+        error.
         """
         is_option = "option_symbol" in position
 
@@ -139,17 +159,27 @@ class PortfolioManager:
         gross, net = calculate_net_pnl(entry, exit_price, qty, action,
                                        entry_ch, exit_ch)
 
-        # Close in DB
+        # Close in DB — this is the actual race guard. status='OPEN' is
+        # enforced in the WHERE clause at the DB layer; the bool return
+        # tells us whether THIS call is the one that won the race.
         if is_option:
-            self.db.close_option_position(
+            closed = self.db.close_option_position(
                 position["id"], exit_price, exit_reason, gross, exit_ch
             )
         else:
-            self.db.close_position(
+            closed = self.db.close_position(
                 position["id"], exit_price, exit_reason, gross, exit_ch
             )
 
-        # Update account capital
+        if not closed:
+            logger.warning(
+                f"apply_trade_close: position {position['id']} was already "
+                f"CLOSED — skipping duplicate account update"
+            )
+            return None
+
+        # Only reaches here if this call actually performed the close,
+        # so it's safe to apply net P&L to current_capital exactly once.
         account = self.db.get_account(mode)
         new_cap = account["current_capital"] + net
         new_pnl = account["total_pnl"] + net
@@ -172,3 +202,4 @@ class PortfolioManager:
             "total_charges": entry_ch + exit_ch,
             "exit_reason": exit_reason,
         }
+    

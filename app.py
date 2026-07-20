@@ -97,6 +97,17 @@ logger.info(f"Paper Trading System v7.0 starting - mode={TRADING_MODE}")
 # open - see PATCH_NOTES.md. Runs once, at import time, before the worker
 # thread starts below, so nothing new can be claimed before this recovery
 # pass has a chance to requeue anything stuck.
+#
+# NOTE: under multi-worker gunicorn, a row reset here isn't guaranteed to
+# have come from a truly dead process — it can also fire against a row
+# that's still being legitimately (if slowly) processed by another
+# worker, if that processing crosses the 60s staleness window (e.g. a
+# cold Neon reconnect). See recover_stuck_webhooks() docstring in
+# database.py. The webhook_id idempotency guard on
+# open_position()/open_option_position() plus the status='OPEN' guard on
+# close_position()/close_option_position() is what makes a subsequent
+# duplicate claim-and-process attempt safe regardless of which of these
+# two cases actually happened.
 _recovered = db.recover_stuck_webhooks(TRADING_MODE)
 if _recovered:
     logger.warning(f"Recovered {_recovered} webhook(s) stuck in PROCESSING from a previous process")
@@ -233,6 +244,12 @@ def close_all_positions_eod(reason: str = "EOD Auto-Close 15:20"):
                 result = portfolio.apply_trade_close(
                     pos, close_price, exit_reason, TRADING_MODE
                 )
+                if result is None:
+                    logger.info(
+                        f"EOD close: position {pos['id']} already closed "
+                        f"(race with another worker/retry) — skipping"
+                    )
+                    continue
                 notify_trade_close(
                     pos["symbol"], pos["action"],
                     pos["entry_price"], close_price,
@@ -257,6 +274,12 @@ def close_all_positions_eod(reason: str = "EOD Auto-Close 15:20"):
                 result = portfolio.apply_trade_close(
                     pos, opt_price, exit_reason, TRADING_MODE
                 )
+                if result is None:
+                    logger.info(
+                        f"EOD close: option position {pos['id']} already "
+                        f"closed (race with another worker/retry) — skipping"
+                    )
+                    continue
                 notify_trade_close(
                     pos["option_symbol"], "SELL",
                     pos["premium"], opt_price,
@@ -596,6 +619,12 @@ def api_close_position(pos_id):
         result = portfolio.apply_trade_close(
             position, close_price, exit_reason, TRADING_MODE
         )
+        if result is None:
+            # Lost a race against another worker/retry that closed this
+            # position first, between our status check above and the
+            # DB write. Not an error — report it as a conflict, not a 500.
+            return jsonify({"success": False, "message": "Position already closed"}), 409
+
         notify_trade_close(
             position["symbol"], position["action"],
             position["entry_price"], close_price,
@@ -647,7 +676,7 @@ def _webhook_worker():
             continue
 
         try:
-            _process_webhook_action(job["action"], job["payload"], job["symbol"])
+            _process_webhook_action(job["action"], job["payload"], job["symbol"], job["id"])
             db.mark_webhook_processed(job["id"])
         except Exception as e:
             logger.error(f"Unhandled error in webhook worker: {job['action']} {job['symbol']}: {e}")
@@ -729,21 +758,30 @@ def api_webhook():
         return jsonify(resp), code
 
 
-def _process_webhook_action(action: str, payload: dict, symbol: str):
+def _process_webhook_action(action: str, payload: dict, symbol: str, webhook_id: int):
     """
     Runs off-thread, after the webhook response has already been sent.
     Any exception here can no longer become an HTTP status code TradingView
     will see, so it's logged and reported via Telegram instead of raised.
     Re-raised at the end so the worker's mark_webhook_failed() call (see
     _webhook_worker above) records it against the pending_webhooks row too.
+
+    webhook_id (NEW 2026-07-20) is threaded through to the open-side
+    handlers so db.open_position()/db.open_option_position() can tag the
+    resulting row and reject a duplicate INSERT for the same webhook_id
+    at the DB layer — see database.py idx_positions_webhook_id /
+    idx_option_positions_webhook_id. Exit-side handlers don't need it:
+    their duplicate guard is the status='OPEN' condition on the UPDATE
+    itself (see close_position()/close_option_position()), which doesn't
+    require knowing which webhook originally opened the position.
     """
     try:
         if action in ("BUY", "SELL"):
-            _handle_open(payload, action, symbol)
+            _handle_open(payload, action, symbol, webhook_id)
         elif action in ("EXIT", "EXIT_LONG", "EXIT_SHORT"):
             _handle_exit(payload, symbol)
         elif action == "BUY_OPTION":
-            _handle_open_option(payload, symbol)
+            _handle_open_option(payload, symbol, webhook_id)
         elif action == "EXIT_OPTION":
             _handle_exit_option(payload, symbol)
         else:
@@ -776,7 +814,7 @@ def _notify_rejection(action: str, symbol: str, message: str):
     )
 
 
-def _handle_open(payload: dict, action: str, symbol: str):
+def _handle_open(payload: dict, action: str, symbol: str, webhook_id: int):
     entry = float(payload.get("price", 0))
     if entry <= 0:
         _notify_rejection(action, symbol, "Valid price required")
@@ -811,8 +849,22 @@ def _handle_open(payload: dict, action: str, symbol: str):
         entry_price=entry, quantity=qty,
         stop_loss=sl, take_profit=tp,
         entry_charges=charges, atr=atr, adx=adx,
-        confluence_score=confluence
+        confluence_score=confluence, webhook_id=webhook_id
     )
+
+    if pos_id is None:
+        # webhook_id already used to open a position — this is the
+        # duplicate-claim race (recovered-but-not-dead row under
+        # multi-worker gunicorn, or a retried claim), not an error.
+        # See database.py open_position() and idx_positions_webhook_id.
+        send_message(
+            f"ℹ️ *Duplicate signal ignored*\n"
+            f"Action: `{action}` Symbol: `{symbol}`\n"
+            f"webhook_id `{webhook_id}` already processed — no new position opened.\n"
+            f"Time: `{ist_now()}`"
+        )
+        logger.info(f"Duplicate OPEN ignored: webhook_id={webhook_id} {action} {symbol}")
+        return
 
     # NOTE: current_capital is intentionally NOT reduced here. It represents
     # realized cash and is only adjusted once, at close, via
@@ -849,6 +901,16 @@ def _handle_exit(payload: dict, symbol: str):
     reason = payload.get("exit_reason", "Signal Exit")
     result = portfolio.apply_trade_close(position, exit_price, reason, TRADING_MODE)
 
+    if result is None:
+        # Lost a race against another worker/retry that closed this
+        # position first — not an error, just a duplicate EXIT signal
+        # arriving after the fact.
+        logger.info(
+            f"EXIT for {symbol}: position {position['id']} already "
+            f"closed — skipping duplicate notify"
+        )
+        return
+
     notify_trade_close(
         symbol, position["action"],
         position["entry_price"], exit_price,
@@ -858,7 +920,7 @@ def _handle_exit(payload: dict, symbol: str):
     logger.info(f"Position closed: {symbol} @ Rs.{exit_price} pnl=Rs.{result['net_pnl']}")
 
 
-def _handle_open_option(payload: dict, symbol: str):
+def _handle_open_option(payload: dict, symbol: str, webhook_id: int):
     option_symbol = payload.get("option_symbol", "")
     option_type   = payload.get("option_type", "CE").upper()
     strike        = float(payload.get("strike", 0))
@@ -896,8 +958,21 @@ def _handle_open_option(payload: dict, symbol: str):
         option_symbol=option_symbol, option_type=option_type,
         strike=strike, expiry=expiry, premium=premium,
         quantity=qty, stop_loss=sl, take_profit=tp,
-        entry_charges=charges
+        entry_charges=charges, webhook_id=webhook_id
     )
+
+    if pos_id is None:
+        # webhook_id already used to open an option position — duplicate
+        # claim race, not an error. See database.py open_option_position()
+        # and idx_option_positions_webhook_id.
+        send_message(
+            f"ℹ️ *Duplicate signal ignored*\n"
+            f"Action: `BUY_OPTION` Symbol: `{option_symbol}`\n"
+            f"webhook_id `{webhook_id}` already processed — no new position opened.\n"
+            f"Time: `{ist_now()}`"
+        )
+        logger.info(f"Duplicate BUY_OPTION ignored: webhook_id={webhook_id} {option_symbol}")
+        return
 
     # NOTE: current_capital is intentionally NOT reduced here. Previously
     # this deducted the full premium*qty notional at open, and
@@ -940,6 +1015,16 @@ def _handle_exit_option(payload: dict, symbol: str):
 
     reason = payload.get("exit_reason", "Signal Exit")
     result = portfolio.apply_trade_close(position, exit_premium, reason, TRADING_MODE)
+
+    if result is None:
+        # Lost a race against another worker/retry that closed this
+        # option position first — duplicate EXIT_OPTION signal, not an
+        # error.
+        logger.info(
+            f"EXIT_OPTION for {option_symbol}: position {position['id']} "
+            f"already closed — skipping duplicate notify"
+        )
+        return
 
     notify_trade_close(
         option_symbol, "SELL",
