@@ -12,7 +12,6 @@ Features:
 
 import os
 import logging
-import queue
 import threading
 import time
 from datetime import datetime
@@ -90,6 +89,24 @@ VALID_ACTIONS = {
 }
 
 logger.info(f"Paper Trading System v7.0 starting - mode={TRADING_MODE}")
+
+# NEW (2026-07-20): recover any webhook that was claimed by a previous
+# process (PROCESSING) but never finished, e.g. because that process was
+# killed mid-flight by a deploy, crash, or gunicorn worker recycle. This
+# is what actually closes the gap the old in-memory queue.Queue() left
+# open - see PATCH_NOTES.md. Runs once, at import time, before the worker
+# thread starts below, so nothing new can be claimed before this recovery
+# pass has a chance to requeue anything stuck.
+_recovered = db.recover_stuck_webhooks(TRADING_MODE)
+if _recovered:
+    logger.warning(f"Recovered {_recovered} webhook(s) stuck in PROCESSING from a previous process")
+    send_message(
+        f"⚠️ *Recovered {_recovered} interrupted webhook(s)*\n"
+        f"A previous process died mid-flight (deploy/crash/restart) while "
+        f"handling {_recovered} signal(s). They've been requeued and will "
+        f"be processed now.\n"
+        f"Mode: `{TRADING_MODE}`"
+    )
 
 
 def ist_now() -> str:
@@ -352,19 +369,6 @@ def options():
 
 
 # ── Health ─────────────────────────────────────────────────────────────────
-# CHANGED: db.get_account() and db.is_trading_enabled() used to run on every
-# single /health hit. Render's own infra poller was hitting /health every
-# ~5 seconds around the clock (confirmed in Render logs), which meant two
-# live Postgres queries every 5 seconds, 24/7 - including nights and
-# weekends when nothing is happening. On a scale-to-zero DB (e.g. Neon free
-# tier), this keeps compute permanently "awake" and burns through the
-# monthly compute-hour budget purely from health-check traffic, unrelated
-# to actual trading activity. Fix: cache the DB status and only refresh it
-# at most once every HEALTH_CACHE_TTL_SECONDS. Response JSON shape is
-# unchanged, so premarket_check.py and everything else keeps working as-is.
-# /api/health/refresh is added as an escape hatch to force a live check
-# on demand (e.g. from premarket_check.py if you want a guaranteed-fresh
-# read instead of a possibly-cached one).
 
 _health_cache = {"database": "unknown", "trading_enabled": True}
 _health_cache_updated_at = 0.0
@@ -616,36 +620,41 @@ def api_close_position(pos_id):
         return jsonify(resp), code
 
 
-# FIX (2026-07-15): the first version of this used `threading.Thread(...).start()`
-# per request, which fixed the TradingView timeout but introduced a NEW bug:
-# two webhooks for the same symbol arriving close together (e.g. a BUY
-# immediately followed by an EXIT — exactly what webhook_tester.py sends,
-# and exactly what a fast SL/reversal can produce live) are no longer
-# guaranteed to be *processed* in the order they were *received*, because
-# each got its own thread racing independently. Confirmed live: BUY_OPTION
-# acked at 09:13:32, EXIT_OPTION acked at 09:13:34, but the BUY's own DB
-# write didn't land until 09:13:37.932 — so the EXIT's thread ran first,
-# found no open position, silently sent the "untracked position" Telegram
-# alert, and dropped the exit. The original synchronous code never had
-# this problem because Flask's dev server handles one request at a time,
-# so ordering was guaranteed for free.
-#
-# Fix: a single background worker thread pulls jobs off a FIFO queue and
-# processes them strictly one at a time, in arrival order. The webhook
-# route still responds instantly (put() on a queue is effectively
-# instant) — it just no longer risks a same-symbol race.
-_webhook_queue: "queue.Queue" = queue.Queue()
+# NEW (2026-07-20): the FIFO in-memory queue.Queue() from the 2026-07-15
+# fix is gone. It correctly fixed the BUY/EXIT ordering race (see prior
+# comment history), but introduced a silent-loss risk: anything sitting in
+# process memory between webhook receipt and processing vanished with zero
+# trace if the process died in that window (deploy, gunicorn worker
+# recycle, crash). The FIFO worker below now polls the pending_webhooks
+# table (Postgres/Neon) instead, so "received but not processed" is a
+# durable DB row that survives a restart - see recover_stuck_webhooks()
+# call above and PATCH_NOTES.md for the one remaining edge case.
+
+_WORKER_POLL_INTERVAL_SECONDS = 0.5
 
 
 def _webhook_worker():
     while True:
-        action, payload, symbol = _webhook_queue.get()
         try:
-            _process_webhook_action(action, payload, symbol)
+            job = db.claim_next_pending_webhook(TRADING_MODE)
         except Exception as e:
-            logger.error(f"Unhandled error in webhook worker: {action} {symbol}: {e}")
-        finally:
-            _webhook_queue.task_done()
+            logger.error(f"Failed to poll pending_webhooks: {e}")
+            time.sleep(_WORKER_POLL_INTERVAL_SECONDS)
+            continue
+
+        if not job:
+            time.sleep(_WORKER_POLL_INTERVAL_SECONDS)
+            continue
+
+        try:
+            _process_webhook_action(job["action"], job["payload"], job["symbol"])
+            db.mark_webhook_processed(job["id"])
+        except Exception as e:
+            logger.error(f"Unhandled error in webhook worker: {job['action']} {job['symbol']}: {e}")
+            try:
+                db.mark_webhook_failed(job["id"], str(e))
+            except Exception as mark_err:
+                logger.error(f"Also failed to mark webhook {job['id']} as failed: {mark_err}")
 
 
 threading.Thread(target=_webhook_worker, daemon=True).start()
@@ -664,17 +673,18 @@ threading.Thread(target=_webhook_worker, daemon=True).start()
 # marked the delivery "failed - request took too long and timed out",
 # because ITS clock had already given up before the response went out.
 #
-# Fix: split the route into (1) fast, DB-free validation that must
-# succeed synchronously - rate limit, JSON parse, webhook secret, action
-# name - and (2) the actual risk-check + DB write + notify, which is now
-# queued onto the single FIFO worker above and processed AFTER an
-# immediate 200 is returned. TradingView doesn't read the response body,
-# so this loses nothing on that side. Anything that used to come back as
-# a 400 (risk rejected, position not found) is now reported over Telegram
-# instead, since the HTTP response is already gone by the time that logic
-# runs - notify_circuit_breaker() and the untracked-position alerts
-# already did this; _notify_rejection() below extends the same pattern to
-# ordinary risk-validation rejections.
+# Fix: split the route into (1) fast, synchronous validation - rate
+# limit, JSON parse, webhook secret, action name - plus a single INSERT
+# into pending_webhooks (db.enqueue_webhook, see database.py), and (2) the
+# actual risk-check + DB write + notify, which happens off-thread,
+# strictly in arrival order, after the 200 has already gone out.
+# TradingView doesn't read the response body, so this loses nothing on
+# that side. Anything that used to come back as a 400 (risk rejected,
+# position not found) is now reported over Telegram instead, since the
+# HTTP response is already gone by the time that logic runs -
+# notify_circuit_breaker() and the untracked-position alerts already did
+# this; _notify_rejection() below extends the same pattern to ordinary
+# risk-validation rejections.
 
 @app.route("/api/webhook", methods=["POST"])
 def api_webhook():
@@ -699,11 +709,13 @@ def api_webhook():
 
         symbol = payload.get("symbol", "NIFTY").upper()
 
-        # Queue it (FIFO, single worker — see _webhook_worker above) and
-        # respond immediately. This is what actually fixes the timeout:
-        # everything DB/risk-manager related now happens after the response
-        # has already gone out, but strictly in arrival order.
-        _webhook_queue.put((action, payload, symbol))
+        # Persist it (single INSERT, still fast enough to stay well under
+        # TradingView's 3s window) and respond immediately. This is what
+        # actually fixes the timeout AND survives a restart: everything
+        # DB/risk-manager related happens after the response has already
+        # gone out, in arrival order, off a durable queue instead of an
+        # in-memory one.
+        db.enqueue_webhook(TRADING_MODE, action, symbol, payload)
 
         return jsonify({
             "success": True,
@@ -722,6 +734,8 @@ def _process_webhook_action(action: str, payload: dict, symbol: str):
     Runs off-thread, after the webhook response has already been sent.
     Any exception here can no longer become an HTTP status code TradingView
     will see, so it's logged and reported via Telegram instead of raised.
+    Re-raised at the end so the worker's mark_webhook_failed() call (see
+    _webhook_worker above) records it against the pending_webhooks row too.
     """
     try:
         if action in ("BUY", "SELL"):
@@ -743,6 +757,7 @@ def _process_webhook_action(action: str, payload: dict, symbol: str):
             f"Error: `{e}`\n"
             f"Time: `{ist_now()}`"
         )
+        raise
 
 
 def _notify_rejection(action: str, symbol: str, message: str):

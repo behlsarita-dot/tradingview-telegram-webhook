@@ -21,10 +21,11 @@ Requires env var: DATABASE_URL - the Neon connection string, e.g.
 """
 
 import os
+import json
 import logging
 import uuid
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, List, Dict
 
 import psycopg2
@@ -173,6 +174,37 @@ class DatabaseManager:
                 )
             """)
 
+            # NEW (2026-07-20): persisted webhook queue. Replaces the
+            # in-memory queue.Queue() that used to live in app.py.
+            # That queue held un-processed webhooks only in process
+            # memory between the instant TradingView got its 200 and
+            # the moment the background worker actually processed the
+            # trade - so any deploy, gunicorn worker recycle, or crash
+            # in that window silently dropped the trade with zero log
+            # trace. This table makes "received but not yet processed"
+            # a durable DB row instead, so a restart can pick up where
+            # it left off. See PATCH_NOTES.md for the one residual edge
+            # case (crash between claim and mark-processed -> possible
+            # duplicate reprocessing, not loss).
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS pending_webhooks (
+                    id SERIAL PRIMARY KEY,
+                    mode TEXT NOT NULL DEFAULT 'PAPER',
+                    action TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    payload JSONB NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'PENDING',
+                    created_at TEXT NOT NULL,
+                    claimed_at TEXT,
+                    processed_at TEXT,
+                    error TEXT
+                )
+            """)
+            c.execute("""
+                CREATE INDEX IF NOT EXISTS idx_pending_webhooks_status
+                ON pending_webhooks (mode, status, id)
+            """)
+
             # Postgres supports ADD COLUMN IF NOT EXISTS directly, so no
             # need for the old SQLite PRAGMA table_info() + manual check.
             c.execute("ALTER TABLE account ADD COLUMN IF NOT EXISTS trading_enabled INTEGER DEFAULT 1")
@@ -254,6 +286,100 @@ class DatabaseManager:
                 "UPDATE account SET peak_capital=%s, updated_at=%s WHERE mode=%s",
                 (peak, datetime.now().isoformat(), mode)
             )
+
+    # ------------------------------------------------------------------ #
+    # PENDING WEBHOOKS (persisted queue — replaces in-memory queue.Queue())
+    # ------------------------------------------------------------------ #
+
+    def enqueue_webhook(self, mode: str, action: str, symbol: str, payload: dict) -> int:
+        """Called synchronously from /api/webhook, before the 200 is
+        returned. A single INSERT - no risk validation, no position
+        writes - so it stays fast enough to not reintroduce the
+        TradingView 3-second timeout the background-thread fix (2026-07-14)
+        was built to avoid."""
+        now = datetime.now().isoformat()
+        with self.get_cursor() as c:
+            c.execute("""
+                INSERT INTO pending_webhooks (mode, action, symbol, payload, status, created_at)
+                VALUES (%s, %s, %s, %s, 'PENDING', %s)
+                RETURNING id
+            """, (mode, action, symbol, json.dumps(payload), now))
+            return c.fetchone()["id"]
+
+    def claim_next_pending_webhook(self, mode: str = "PAPER") -> Optional[Dict]:
+        """Atomically claims the oldest PENDING row for this mode and
+        flips it to PROCESSING, using FOR UPDATE SKIP LOCKED so this is
+        safe to call from more than one process/worker concurrently
+        (e.g. if gunicorn ever runs multiple workers) without two
+        workers claiming the same row."""
+        now = datetime.now().isoformat()
+        with self.get_cursor() as c:
+            c.execute("""
+                SELECT id, action, symbol, payload FROM pending_webhooks
+                WHERE mode=%s AND status='PENDING'
+                ORDER BY id ASC
+                LIMIT 1
+                FOR UPDATE SKIP LOCKED
+            """, (mode,))
+            row = c.fetchone()
+            if not row:
+                return None
+            c.execute("""
+                UPDATE pending_webhooks SET status='PROCESSING', claimed_at=%s WHERE id=%s
+            """, (now, row["id"]))
+            return {
+                "id": row["id"],
+                "action": row["action"],
+                "symbol": row["symbol"],
+                "payload": row["payload"],  # psycopg2 decodes JSONB to dict automatically
+            }
+
+    def mark_webhook_processed(self, webhook_id: int):
+        with self.get_cursor() as c:
+            c.execute("""
+                UPDATE pending_webhooks SET status='PROCESSED', processed_at=%s WHERE id=%s
+            """, (datetime.now().isoformat(), webhook_id))
+
+    def mark_webhook_failed(self, webhook_id: int, error: str):
+        with self.get_cursor() as c:
+            c.execute("""
+                UPDATE pending_webhooks SET status='FAILED', processed_at=%s, error=%s WHERE id=%s
+            """, (datetime.now().isoformat(), str(error)[:2000], webhook_id))
+
+    def recover_stuck_webhooks(self, mode: str = "PAPER", stale_after_seconds: int = 60) -> int:
+        """Call once at process startup, before the worker thread starts.
+        Any row still PROCESSING from a previous process that died
+        mid-flight (deploy, crash, worker recycle) gets reset to PENDING
+        so it's picked up again instead of being lost forever. Returns
+        the number of rows recovered, so app.py can log/Telegram it -
+        that count is your only visibility into "a restart actually
+        interrupted a webhook," which previously didn't exist at all.
+
+        FIX (2026-07-20): originally compared claimed_at against
+        Postgres's NOW(), which is timezone-aware (UTC on Neon) while
+        claimed_at is a naive local-clock timestamp (IST on the machine
+        writing it). Postgres implicitly treated the naive value as if
+        it were already in UTC, shifting it 5.5 hours forward and making
+        every row look "claimed in the future" relative to true UTC now
+        - so the old query always matched zero rows, silently, with no
+        error and no log line (since `if _recovered:` is falsy on 0).
+        Confirmed via test_webhook_persistence.py --setup-stale/--verify:
+        a row claimed 90s ago was never recovered on restart under the
+        old NOW()-based query. Fix: compute the cutoff in Python using
+        the same naive-clock convention already used for
+        entry_time/exit_time/created_at everywhere else in this file,
+        and compare two naive strings directly - no timezone cast for
+        Postgres to get wrong."""
+        cutoff = (datetime.now() - timedelta(seconds=stale_after_seconds)).isoformat()
+        with self.get_cursor() as c:
+            c.execute("""
+                UPDATE pending_webhooks
+                SET status='PENDING', claimed_at=NULL
+                WHERE mode=%s AND status='PROCESSING'
+                  AND claimed_at < %s
+                RETURNING id
+            """, (mode, cutoff))
+            return len(c.fetchall())
 
     # ------------------------------------------------------------------ #
     # SHARED HELPERS
@@ -605,4 +731,5 @@ class DatabaseManager:
                 ) t
             """, (mode, today, mode, today))
             return c.fetchone()["cnt"] or 0
+        
         
