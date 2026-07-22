@@ -146,7 +146,17 @@ def _notify_trade_open_sync(symbol: str, action: str, entry: float,
                             pos_id: str = None, charges: float = 0.0):
     sl_str = f"Rs.{sl:,.2f}" if sl else "Not set"
     tp_str = f"Rs.{tp:,.2f}" if tp else "Not set"
-    icon = "POSITION OPENED (LONG)" if action.upper() in ("BUY", "LONG") else "POSITION OPENED (SHORT)"
+    # FIX (2026-07-22): was an exact match against ("BUY", "LONG"), which
+    # only ever matched the equity path (_handle_open sends plain "BUY"/
+    # "SELL"). The options path (_handle_open_option) sends "BUY CE" or
+    # "BUY PE" - action.upper() == "BUY CE" fails the exact-match check
+    # and fell through to the SHORT label, mislabeling every option BUY
+    # (CE or PE) as a short position in Telegram. Confirmed live on
+    # NIFTY260728C24300, 2026-07-22 13:40 IST: action="BUY CE", Telegram
+    # showed "POSITION OPENED (SHORT)" for what was actually a long call.
+    # Now uses a prefix check so "BUY", "BUY CE", "BUY PE", and "LONG"
+    # all correctly resolve to LONG.
+    icon = "POSITION OPENED (LONG)" if action.upper().startswith(("BUY", "LONG")) else "POSITION OPENED (SHORT)"
     msg = (
         f"*{icon}*\n"
         f"---------------------\n"
@@ -278,3 +288,4 @@ def get_status() -> dict:
 
 def _now() -> str:
     return datetime.now().strftime("%d-%m-%Y %H:%M:%S")
+    
