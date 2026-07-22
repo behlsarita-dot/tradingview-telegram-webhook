@@ -75,6 +75,80 @@ def fetch_trades(conn, start, end):
         return c.fetchall()
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# DATA INTEGRITY CHECK — flags option trades where exit_reason is
+# inconsistent with the direction implied by exit_premium vs entry_premium.
+#
+# For a bought CE/PE:
+#   exit_reason == "SL"  should mean exit_premium < entry_premium (a loss)
+#   exit_reason == "TP"  should mean exit_premium > entry_premium (a gain)
+#   REVERSAL has no fixed constraint - skipped
+#
+# Root cause this catches: pre-2026-07-13, the Trading Bot Script's
+# EXIT_OPTION alert sent the bar's `close` as "premium" regardless of
+# whether the exit was an SL or TP hit. On a 5-min bar, price could pierce
+# slPrice/tpPrice intrabar (correctly tagging exit_reason) and then
+# recover before the candle closed, so `close` no longer reflected where
+# the exit actually filled. Confirmed live on NIFTY260721P24100
+# (2026-07-13 09:20 entry): exit_reason="SL" but premium sent was 227.59,
+# above BOTH slPrice (205.34) and tpPrice (225.34). Fixed same day in the
+# Pine script (now sends exitFillPriceLong/Short, captured before the
+# position-reset block clears slPrice/tpPrice). This check is a permanent
+# safety net, not a one-time date-based patch, so it also catches any
+# future regression of the same kind.
+# ═══════════════════════════════════════════════════════════════════════════
+
+def flag_inconsistent_exits(trades):
+    """
+    Splits closed trades into (clean, flagged) based on whether
+    exit_reason matches the direction implied by exit_premium vs
+    entry_premium. Open trades (no exit_premium yet) pass through as
+    clean unchanged.
+    """
+    clean, flagged = [], []
+    for t in trades:
+        if str(t.get("status", "")).upper() != "CLOSED":
+            clean.append(t)
+            continue
+
+        reason = (t.get("exit_reason") or "").upper()
+        entry_premium = t.get("entry_premium")
+        exit_premium = t.get("exit_premium")
+
+        if entry_premium is None or exit_premium is None:
+            clean.append(t)
+            continue
+
+        entry_premium = float(entry_premium)
+        exit_premium = float(exit_premium)
+
+        inconsistent = (
+            (reason == "SL" and exit_premium >= entry_premium) or
+            (reason == "TP" and exit_premium <= entry_premium)
+        )
+
+        if inconsistent:
+            t["_flag_reason"] = (
+                f"exit_reason={reason} but exit_premium={exit_premium} vs "
+                f"entry_premium={entry_premium} implies the opposite direction"
+            )
+            flagged.append(t)
+        else:
+            clean.append(t)
+
+    return clean, flagged
+
+
+def print_flagged(flagged):
+    if not flagged:
+        return
+    print(f"\n⚠️  {len(flagged)} trade(s) excluded from stats — inconsistent exit_reason:")
+    for t in flagged:
+        print(f"   {t.get('option_symbol', '?')}  entry={t.get('entry_time', '?')}  "
+              f"— {t.get('_flag_reason', '')}")
+    print()
+
+
 def summarize(trades):
     closed = [t for t in trades if str(t.get("status", "")).upper() == "CLOSED"]
     open_ = [t for t in trades if str(t.get("status", "")).upper() == "OPEN"]
@@ -129,12 +203,13 @@ def summarize(trades):
     }
 
 
-def print_report(start, end, summary):
+def print_report(start, end, summary, flagged_count):
     print(f"\n=== Weekly Trading Report | {start.date()} to {end.date()} | Mode: {TRADING_MODE_FILTER} ===\n")
 
     print("-- Overview --")
     print(f"  Total trades (open+closed): {summary['total_trades']}")
-    print(f"  Closed trades:              {summary['closed_trades']}")
+    print(f"  Closed trades:              {summary['closed_trades']}"
+          + (f"  ({flagged_count} excluded, inconsistent exit_reason)" if flagged_count else ""))
     print(f"  Open trades:                {summary['open_trades']}")
     print(f"  Win rate:                   {summary['win_rate']:.1f}%  ({summary['wins']}W / {summary['losses']}L)")
     print(f"  Total net P&L:              Rs.{summary['total_net_pnl']:,.2f}")
@@ -170,8 +245,12 @@ def main():
             print(f"\nNo trades found for {TRADING_MODE_FILTER} mode between "
                   f"{start.date()} and {end.date()}.")
             return
+
+        trades, flagged = flag_inconsistent_exits(trades)
+        print_flagged(flagged)
+
         summary = summarize(trades)
-        print_report(start, end, summary)
+        print_report(start, end, summary, len(flagged))
     finally:
         conn.close()
 
