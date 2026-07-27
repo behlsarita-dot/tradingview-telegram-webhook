@@ -658,12 +658,56 @@ def api_close_position(pos_id):
 # table (Postgres/Neon) instead, so "received but not processed" is a
 # durable DB row that survives a restart - see recover_stuck_webhooks()
 # call above and PATCH_NOTES.md for the one remaining edge case.
+#
+# UPDATED (2026-07-27): the worker previously polled unconditionally,
+# 24/7, every 0.5s — including nights, weekends, and off-hours, when
+# there is never anything to process (no TradingView alerts fire outside
+# market hours, and EOD close/kill-switch/trading-enable are already
+# handled independently by the day_of_week="mon-fri" APScheduler cron
+# jobs above, which don't depend on this loop running at all). That
+# unconditional polling was the dominant driver of Neon compute-hour
+# quota usage. The loop now only polls Neon Mon-Fri, 09:00-15:30 IST;
+# outside that window it sleeps without touching the DB at all.
 
 _WORKER_POLL_INTERVAL_SECONDS = 0.5
+_WEEKEND_SLEEP_SECONDS = 1800   # 30 min - just needs to notice Monday arrived
+_OFF_HOURS_SLEEP_SECONDS = 300  # 5 min - needs to notice market open reasonably promptly
+
+_MARKET_START_HOUR, _MARKET_START_MIN = 9, 0    # a little early, covers pre-open signals
+_MARKET_END_HOUR, _MARKET_END_MIN = 15, 30      # a little past EOD close, covers late/retry webhooks
+
+
+def _is_trading_day(now_ist: datetime) -> bool:
+    """Mon-Fri only. NSE doesn't trade weekends, so there's no reason to
+    keep hitting Neon (and burning compute-hour quota) on Sat/Sun."""
+    return now_ist.weekday() < 5  # 0=Mon ... 4=Fri, 5=Sat, 6=Sun
+
+
+def _is_market_hours(now_ist: datetime) -> bool:
+    """09:00-15:30 IST. Outside this window there's nothing for the worker
+    to do - no TradingView alerts fire, and EOD close/kill-switch/etc are
+    already handled by the separate APScheduler cron jobs above, which
+    don't depend on this loop running."""
+    start = now_ist.replace(hour=_MARKET_START_HOUR, minute=_MARKET_START_MIN, second=0, microsecond=0)
+    end = now_ist.replace(hour=_MARKET_END_HOUR, minute=_MARKET_END_MIN, second=0, microsecond=0)
+    return start <= now_ist <= end
 
 
 def _webhook_worker():
     while True:
+        now_ist = datetime.now(IST)
+
+        if not _is_trading_day(now_ist):
+            # Weekend: don't touch the DB at all.
+            time.sleep(_WEEKEND_SLEEP_SECONDS)
+            continue
+
+        if not _is_market_hours(now_ist):
+            # Weekday, but outside 09:00-15:30 IST: nothing to process,
+            # no reason to keep the Neon compute endpoint awake.
+            time.sleep(_OFF_HOURS_SLEEP_SECONDS)
+            continue
+
         try:
             job = db.claim_next_pending_webhook(TRADING_MODE)
         except Exception as e:
