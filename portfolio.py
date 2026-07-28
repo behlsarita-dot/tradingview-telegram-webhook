@@ -180,19 +180,17 @@ class PortfolioManager:
 
         # Only reaches here if this call actually performed the close,
         # so it's safe to apply net P&L to current_capital exactly once.
-        account = self.db.get_account(mode)
-        new_cap = account["current_capital"] + net
-        new_pnl = account["total_pnl"] + net
-        new_wins = account["winning_trades"] + (1 if net >= 0 else 0)
-        new_loss = account["losing_trades"] + (1 if net < 0 else 0)
-
-        self.db.update_account(
-            mode,
-            current_capital=round(new_cap, 2),
-            total_pnl=round(new_pnl, 2),
-            winning_trades=new_wins,
-            losing_trades=new_loss
-        )
+        #
+        # FIX (2026-07-28): previously this did get_account() -> mutate in
+        # Python -> update_account(), which is a read-then-write across
+        # two separate connections/transactions. Two positions closing
+        # near-simultaneously (webhook worker thread + EOD close looping
+        # over several positions, etc.) could both read the same starting
+        # current_capital before either wrote back, silently losing one
+        # trade's P&L. apply_capital_delta() does the increment as a
+        # single atomic UPDATE, so this race is closed regardless of how
+        # many callers hit it concurrently.
+        self.db.apply_capital_delta(mode, round(net, 2))
 
         return {
             "gross_pnl": gross,

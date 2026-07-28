@@ -294,6 +294,48 @@ class DatabaseManager:
         with self.get_cursor() as c:
             c.execute(f"UPDATE account SET {fields} WHERE mode=%s", values + [mode])
 
+    def apply_capital_delta(self, mode: str, net_pnl: float) -> Dict:
+        """FIX (2026-07-28): atomic replacement for the old
+        get_account() -> mutate in Python -> update_account() pattern
+        used by PortfolioManager.apply_trade_close(). That pattern reads
+        current_capital/total_pnl/winning_trades/losing_trades into
+        Python, computes new values, then writes them back in a SEPARATE
+        connection/transaction. Two positions closing at nearly the same
+        moment (very possible with the webhook worker thread plus e.g.
+        EOD close iterating several positions back-to-back) can both read
+        the same starting current_capital before either writes - a
+        classic lost-update race. Whichever UPDATE lands second silently
+        overwrites the first, and one trade's P&L quietly vanishes from
+        the account totals even though the position row itself is
+        correctly closed.
+
+        This does the read-modify-write as a single UPDATE statement
+        (current_capital = current_capital + %s, etc.), so Postgres's own
+        row-level locking makes the increment atomic regardless of how
+        many callers race for it. Returns the resulting row so callers
+        that need the new values (none currently do, but kept for
+        parity with update_account()) don't need a second query.
+        """
+        now = datetime.now().isoformat()
+        with self.get_cursor() as c:
+            c.execute("""
+                UPDATE account
+                SET current_capital = current_capital + %s,
+                    total_pnl = total_pnl + %s,
+                    winning_trades = winning_trades + %s,
+                    losing_trades = losing_trades + %s,
+                    updated_at = %s
+                WHERE mode=%s
+                RETURNING current_capital, total_pnl, winning_trades, losing_trades
+            """, (
+                net_pnl, net_pnl,
+                1 if net_pnl >= 0 else 0,
+                1 if net_pnl < 0 else 0,
+                now, mode
+            ))
+            row = c.fetchone()
+            return dict(row) if row else {}
+
     def is_trading_enabled(self, mode: str = "PAPER") -> bool:
         with self.get_cursor() as c:
             c.execute("SELECT trading_enabled FROM account WHERE mode=%s", (mode,))

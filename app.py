@@ -11,6 +11,7 @@ Features:
 """
 
 import os
+import hmac
 import logging
 import threading
 import time
@@ -134,8 +135,14 @@ def normalise_action(action: str) -> str:
 
 
 def verify_webhook_secret(payload: dict):
+    # FIX (2026-07-28): was a plain `!=` string comparison, which short-
+    # circuits on the first mismatched character - technically a timing
+    # side-channel that leaks how many leading characters of a guess are
+    # correct. Low real-world risk for a private bot, but
+    # hmac.compare_digest() is the standard constant-time comparison and
+    # costs nothing to use here.
     secret = payload.get("webhook_secret", "")
-    if secret != WEBHOOK_SECRET:
+    if not hmac.compare_digest(str(secret), str(WEBHOOK_SECRET)):
         raise InvalidWebhookSecretError()
 
 
@@ -395,7 +402,13 @@ def options():
 
 _health_cache = {"database": "unknown", "trading_enabled": True}
 _health_cache_updated_at = 0.0
-HEALTH_CACHE_TTL_SECONDS = 300  # 5 minutes
+# FIX (2026-07-28): was 300s (5 min). If Neon actually went down, /health
+# could keep reporting "connected" for up to 5 minutes after the fact.
+# 60s is a better balance for a trading bot dashboard - still avoids
+# hitting the DB on every single health check, but catches real outages
+# much sooner. Use /api/health/refresh when you need a guaranteed-fresh
+# read regardless of this cache.
+HEALTH_CACHE_TTL_SECONDS = 60
 
 
 def _refresh_health_cache():
