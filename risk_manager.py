@@ -273,24 +273,75 @@ class RiskManager:
 
     def check_trailing_stop(self, position: Dict,
                              current_price: float) -> Tuple[bool, str]:
+        """
+        FIX (2026-08-01): trail_price was derived from current_price
+        itself (trail_price = current_price * (1 - d/100)), then tested
+        as current_price <= trail_price. That compares a number against
+        a strictly smaller version of itself -- mathematically impossible
+        for any positive TRAILING_STOP_DISTANCE, so this never fired. The
+        mirrored short-side branch had the same defect.
+
+        FIX (2026-08-01, v2): the first pass still computed the
+        activation gate from current_price alone:
+            gain_pct = ((current_price - entry) / entry) * 100
+        That re-litigates "has this trade activated trailing yet?" from
+        scratch on every tick using only the LATEST price. A position
+        that ran up past activation, recorded a high peak, then gapped
+        straight back down past both the activation threshold AND the
+        trail level in a single tick (plausible for options) would have
+        gain_pct computed from the low current_price, read as "never
+        activated", and return False without ever comparing
+        current_price to trail_price -- silently skipping the exact
+        fast-reversal case a trailing stop exists to catch.
+
+        Now the activation gate is computed from the peak/trough (which
+        already folds in current_price via max/min) instead of from
+        current_price alone, so once a trade has genuinely reached
+        TRAILING_STOP_ACTIVATION at any point, the trail stays live on
+        every subsequent tick regardless of how sharply price reverses.
+
+        STILL NOT WIRED IN: neither `positions` nor `option_positions`
+        has a highest_price_since_entry / lowest_price_since_entry
+        column yet, and nothing currently calls update_position_price()
+        with a running peak/trough or invokes this function at all --
+        exits in this system are event-driven from TradingView
+        (EXIT/EXIT_OPTION), not server-polled. Wiring this in for real
+        needs: (a) a price-polling loop, (b) persisting the peak/trough
+        this function computes back onto the position row each tick,
+        and (c) a decision on what firing True actually does
+        (presumably a synthetic exit through the same path
+        _handle_exit() uses).
+        """
         if not USE_TRAILING_STOPS:
             return False, ""
         entry = position.get("entry_price", 0)
+        if not entry:
+            return False, ""
+        sl = position.get("stop_loss", 0)
+        if not sl:
+            # Matches original intent: only trail a position that was
+            # opened with an initial stop_loss set.
+            return False, ""
         action = position.get("action", "BUY")
+
         if action.upper() in ("BUY", "LONG"):
-            gain_pct = ((current_price - entry) / entry) * 100
-            if gain_pct >= TRAILING_STOP_ACTIVATION:
-                trail_price = current_price * (1 - TRAILING_STOP_DISTANCE / 100)
-                sl = position.get("stop_loss", 0)
-                if sl and current_price <= trail_price:
-                    return True, f"Trailing stop hit at Rs.{current_price:,.2f}"
+            peak = position.get("highest_price_since_entry", entry)
+            peak = max(peak, current_price)
+            gain_pct = ((peak - entry) / entry) * 100
+            if gain_pct < TRAILING_STOP_ACTIVATION:
+                return False, ""
+            trail_price = peak * (1 - TRAILING_STOP_DISTANCE / 100)
+            if current_price <= trail_price:
+                return True, f"Trailing stop hit at Rs.{current_price:,.2f} (peak Rs.{peak:,.2f})"
         else:
-            gain_pct = ((entry - current_price) / entry) * 100
-            if gain_pct >= TRAILING_STOP_ACTIVATION:
-                trail_price = current_price * (1 + TRAILING_STOP_DISTANCE / 100)
-                sl = position.get("stop_loss", 0)
-                if sl and current_price >= trail_price:
-                    return True, f"Trailing stop hit at Rs.{current_price:,.2f}"
+            trough = position.get("lowest_price_since_entry", entry)
+            trough = min(trough, current_price)
+            gain_pct = ((entry - trough) / entry) * 100
+            if gain_pct < TRAILING_STOP_ACTIVATION:
+                return False, ""
+            trail_price = trough * (1 + TRAILING_STOP_DISTANCE / 100)
+            if current_price >= trail_price:
+                return True, f"Trailing stop hit at Rs.{current_price:,.2f} (trough Rs.{trough:,.2f})"
         return False, ""
 
 

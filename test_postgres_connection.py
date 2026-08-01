@@ -47,7 +47,13 @@ def main():
     # -- 2. DatabaseManager init / schema creation --------------------------
     try:
         from database import DatabaseManager
-        db = DatabaseManager(database_url=url)
+        # FIX (2026-08-01): was DatabaseManager(database_url=url), but
+        # DatabaseManager.__init__ takes `db_url`, not `database_url`
+        # (see database.py: `def __init__(self, db_url: str = DATABASE_URL)`).
+        # That mismatch raised a TypeError on every run, so this
+        # pre-deploy smoke test could never actually pass, regardless of
+        # whether DATABASE_URL itself was correctly configured.
+        db = DatabaseManager(db_url=url)
         print("OK    DatabaseManager initialised (tables created/verified)")
     except Exception as e:
         print(f"FAIL  DatabaseManager init failed: {e}")
@@ -108,3 +114,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    

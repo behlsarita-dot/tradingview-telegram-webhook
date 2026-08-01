@@ -5,8 +5,10 @@ Single source of truth for all settings.
 """
 
 import os
+import time
 import secrets
 import logging
+import threading
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -102,30 +104,83 @@ REDIS_URL = os.getenv('REDIS_URL', '')
 
 
 class MockRedis:
-    """Thread-safe in-memory Redis mock for single-worker deployments."""
+    """Thread-safe in-memory Redis mock for single-worker deployments.
+
+    FIX (2026-08-01): expire() was a no-op stub that returned True but
+    never actually recorded a TTL. rate_limit() in app.py relies on
+    real expiry to reset its window:
+        count = redis.incr(rkey)
+        if count == 1:
+            redis.expire(rkey, window)
+        return count <= limit
+    Against real Redis, the key vanishes after `window` seconds and the
+    next incr() starts a fresh count of 1. Against the old MockRedis,
+    expire() did nothing, so the counter kept growing for the entire
+    life of the process instead of resetting every 60s. Once any single
+    IP crossed `limit` (30) *lifetime* requests, every subsequent
+    webhook from that IP got permanently rejected with 429 until a
+    process restart -- and since init_redis() silently falls back to
+    MockRedis on any Redis connection failure, a transient Upstash
+    outage would quietly turn into a permanent webhook lockout rather
+    than a temporary one.
+
+    Now every key has a real expiry timestamp. get()/incr() check it
+    before touching a key and treat an expired key as absent, so incr()
+    on an expired counter starts over at 1 -- matching real Redis
+    behavior. A lock guards all operations since this docstring already
+    claimed thread-safety that the original implementation didn't
+    actually provide.
+    """
 
     def __init__(self):
         self._store = {}
         self._counts = {}
+        self._expiry = {}   # key -> epoch seconds when it expires
+        self._lock = threading.Lock()
+
+    def _expired(self, key) -> bool:
+        deadline = self._expiry.get(key)
+        return deadline is not None and time.time() >= deadline
+
+    def _purge_if_expired(self, key):
+        if self._expired(key):
+            self._store.pop(key, None)
+            self._counts.pop(key, None)
+            self._expiry.pop(key, None)
 
     def get(self, key):
-        return self._store.get(key)
+        with self._lock:
+            self._purge_if_expired(key)
+            return self._store.get(key)
 
     def set(self, key, value, ex=None):
-        self._store[key] = value
-        return True
+        with self._lock:
+            self._store[key] = value
+            if ex is not None:
+                self._expiry[key] = time.time() + ex
+            else:
+                self._expiry.pop(key, None)
+            return True
 
     def incr(self, key):
-        self._counts[key] = self._counts.get(key, 0) + 1
-        return self._counts[key]
+        with self._lock:
+            self._purge_if_expired(key)
+            self._counts[key] = self._counts.get(key, 0) + 1
+            return self._counts[key]
 
     def expire(self, key, seconds):
-        return True
+        with self._lock:
+            if key not in self._counts and key not in self._store:
+                return False
+            self._expiry[key] = time.time() + seconds
+            return True
 
     def delete(self, key):
-        self._store.pop(key, None)
-        self._counts.pop(key, None)
-        return True
+        with self._lock:
+            self._store.pop(key, None)
+            self._counts.pop(key, None)
+            self._expiry.pop(key, None)
+            return True
 
     def ping(self):
         return True
