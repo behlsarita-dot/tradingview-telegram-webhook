@@ -2,8 +2,8 @@
 """
 Paper Trading System v7.0 - Main Flask Application
 Features:
-- EOD auto-close at 15:20 IST (intraday enforcement)
-- Block new entries after 15:00 IST
+- EOD auto-close at 15:30 IST (intraday enforcement)
+- Block new entries after 15:10 IST
 - Re-enable trading at 09:10 IST
 - Kill switch (manual halt/resume)
 - Emergency close all positions
@@ -214,10 +214,10 @@ def _get_option_price(pos: dict) -> tuple:
 
 # ── EOD Auto-Close ─────────────────────────────────────────────────────────
 
-def close_all_positions_eod(reason: str = "EOD Auto-Close 15:20"):
+def close_all_positions_eod(reason: str = "EOD Auto-Close 15:30"):
     """
     Close all open positions.
-    Used by scheduler at 15:20 and by emergency-close route.
+    Used by scheduler at 15:30 and by emergency-close route.
     Flags estimated prices clearly in exit_reason.
     """
     logger.info(f"Close all triggered: {reason}")
@@ -320,18 +320,23 @@ def close_all_positions_eod(reason: str = "EOD Auto-Close 15:20"):
 
 
 # ── Scheduler ─────────────────────────────────────────────────────────────
+# NOTE: NSE extended F&O trading hours by 10 minutes (market close
+# 15:30 -> 15:40 IST) effective 2026-08-03. These three cron jobs are
+# shifted by the same 10 minutes (was 09:10 / 15:15 / 15:20) so each
+# keeps its original buffer relative to the actual close, matching the
+# _webhook_worker market-hours window below.
 
 def _eod_scheduler_job():
     """Scheduled EOD close — skips if kill switch was manually set by user."""
-    close_all_positions_eod("EOD Auto-Close 15:20")
+    close_all_positions_eod("EOD Auto-Close 15:30")
 
 
 def _block_entries_job():
-    """Block new entries at 15:15 — only if trading was enabled (don't overwrite manual halt)."""
+    """Block new entries at 15:25 — only if trading was enabled (don't overwrite manual halt)."""
     if db.is_trading_enabled(TRADING_MODE):
-        db.set_trading_enabled(False, TRADING_MODE, "Market closed 15:15")
-        logger.info("Scheduler: new entries blocked at 15:15")
-        send_message("*Market Closed*\nNew entries blocked (15:15 IST)")
+        db.set_trading_enabled(False, TRADING_MODE, "Market closed 15:25")
+        logger.info("Scheduler: new entries blocked at 15:25")
+        send_message("*Market Closed*\nNew entries blocked (15:25 IST)")
 
 
 def _enable_trading_job():
@@ -349,12 +354,12 @@ def start_scheduler():
 
         scheduler.add_job(
             _eod_scheduler_job,
-            trigger="cron", hour=15, minute=20,
+            trigger="cron", hour=15, minute=30,
             day_of_week="mon-fri", id="eod_close", replace_existing=True
         )
         scheduler.add_job(
             _block_entries_job,
-            trigger="cron", hour=15, minute=15,
+            trigger="cron", hour=15, minute=25,
             day_of_week="mon-fri", id="block_entries", replace_existing=True
         )
         scheduler.add_job(
@@ -364,7 +369,7 @@ def start_scheduler():
         )
 
         scheduler.start()
-        logger.info("Scheduler started: enable 09:10 | block 15:15 | EOD close 15:20 IST")
+        logger.info("Scheduler started: enable 09:10 | block 15:25 | EOD close 15:30 IST")
         return scheduler
 
     except Exception as e:
@@ -402,13 +407,6 @@ def options():
 
 _health_cache = {"database": "unknown", "trading_enabled": True}
 _health_cache_updated_at = 0.0
-# FIX (2026-07-28): was 300s (5 min). If Neon actually went down, /health
-# could keep reporting "connected" for up to 5 minutes after the fact.
-# 60s is a better balance for a trading bot dashboard - still avoids
-# hitting the DB on every single health check, but catches real outages
-# much sooner. Use /api/health/refresh when you need a guaranteed-fresh
-# read regardless of this cache.
-HEALTH_CACHE_TTL_SECONDS = 60
 
 
 def _refresh_health_cache():
@@ -422,12 +420,31 @@ def _refresh_health_cache():
     _health_cache_updated_at = time.time()
 
 
+# FIX (2026-08-01): render.yaml sets healthCheckPath: /health, and Render
+# pings that path every few seconds, 24/7, for as long as the service is
+# running - this is unconditional and NOT gated by market hours the way
+# the webhook worker was. The old code called _refresh_health_cache() (a
+# real Neon connection) from this route whenever the 60s cache went
+# stale, which - driven purely by Render's own ping frequency - meant a
+# DB touch roughly once a minute around the clock, every day, forever.
+# get_cursor()'s own docstring explains why that's a problem: Neon's
+# free tier is designed to autosuspend after ~5 min idle, and a query
+# every 60s never lets 5 minutes of idle time accumulate. The compute
+# endpoint effectively never suspended, which kept burning compute-hour
+# quota 24/7 independent of the earlier _webhook_worker market-hours fix
+# (that fix addressed the worker's own polling, not this).
+#
+# Nothing in the frontend (static/js/*.js) calls /health or /api/health
+# at all - only Render's automated pinger does - so there's no user-
+# facing cost to no longer refreshing on every hit. /health and
+# /api/health now serve the cache as-is, refreshed once at startup (see
+# the call right after DatabaseManager() below) and on-demand via
+# /api/health/refresh, which is unchanged and still does a guaranteed-
+# fresh DB check when you actually want one.
 @app.route("/health")
 @app.route("/api/health")
 def health():
     uptime = int(time.time() - START_TIME)
-    if time.time() - _health_cache_updated_at > HEALTH_CACHE_TTL_SECONDS:
-        _refresh_health_cache()
     return jsonify({
         "status":          "healthy",
         "version":         "7.0",
@@ -679,15 +696,23 @@ def api_close_position(pos_id):
 # handled independently by the day_of_week="mon-fri" APScheduler cron
 # jobs above, which don't depend on this loop running at all). That
 # unconditional polling was the dominant driver of Neon compute-hour
-# quota usage. The loop now only polls Neon Mon-Fri, 09:00-15:30 IST;
+# quota usage. The loop now only polls Neon Mon-Fri, 09:00-15:40 IST;
 # outside that window it sleeps without touching the DB at all.
+#
+# UPDATED (2026-08-01): NSE extended F&O trading hours by 10 minutes
+# (market close 15:30 -> 15:40 IST) effective 2026-08-03. Shifted this
+# window, plus the block-entries (15:15->15:25) and EOD-close
+# (15:20->15:30) scheduler jobs above, and the hardcoded 15:00 cutoff in
+# _handle_open(), by the same 10 minutes so each keeps its original
+# buffer relative to the actual close instead of that buffer silently
+# shrinking to zero.
 
 _WORKER_POLL_INTERVAL_SECONDS = 0.5
 _WEEKEND_SLEEP_SECONDS = 1800   # 30 min - just needs to notice Monday arrived
 _OFF_HOURS_SLEEP_SECONDS = 300  # 5 min - needs to notice market open reasonably promptly
 
 _MARKET_START_HOUR, _MARKET_START_MIN = 9, 0    # a little early, covers pre-open signals
-_MARKET_END_HOUR, _MARKET_END_MIN = 15, 30      # a little past EOD close, covers late/retry webhooks
+_MARKET_END_HOUR, _MARKET_END_MIN = 15, 40      # a little past EOD close, covers late/retry webhooks
 
 
 def _is_trading_day(now_ist: datetime) -> bool:
@@ -697,7 +722,7 @@ def _is_trading_day(now_ist: datetime) -> bool:
 
 
 def _is_market_hours(now_ist: datetime) -> bool:
-    """09:00-15:30 IST. Outside this window there's nothing for the worker
+    """09:00-15:40 IST. Outside this window there's nothing for the worker
     to do - no TradingView alerts fire, and EOD close/kill-switch/etc are
     already handled by the separate APScheduler cron jobs above, which
     don't depend on this loop running."""
@@ -716,7 +741,7 @@ def _webhook_worker():
             continue
 
         if not _is_market_hours(now_ist):
-            # Weekday, but outside 09:00-15:30 IST: nothing to process,
+            # Weekday, but outside 09:00-15:40 IST: nothing to process,
             # no reason to keep the Neon compute endpoint awake.
             time.sleep(_OFF_HOURS_SLEEP_SECONDS)
             continue
@@ -744,6 +769,12 @@ def _webhook_worker():
 
 
 threading.Thread(target=_webhook_worker, daemon=True).start()
+
+# One-time DB check at startup so /health has a real status to report
+# without ever needing to touch Neon again on Render's own frequent
+# pings - see the FIX comment above the /health route for why this
+# matters. Use /api/health/refresh for a guaranteed-fresh read later.
+_refresh_health_cache()
 
 
 # ── Webhook ────────────────────────────────────────────────────────────────
@@ -877,10 +908,10 @@ def _handle_open(payload: dict, action: str, symbol: str, webhook_id: int):
         _notify_rejection(action, symbol, "Valid price required")
         return
 
-    # Block new entries at or after 15:00 IST
+    # Block new entries at or after 15:10 IST
     now_ist = datetime.now(IST)
-    if now_ist.hour >= 15:
-        _notify_rejection(action, symbol, "New entries blocked after 15:00 IST (intraday only)")
+    if now_ist.hour > 15 or (now_ist.hour == 15 and now_ist.minute >= 10):
+        _notify_rejection(action, symbol, "New entries blocked after 15:10 IST (intraday only)")
         return
 
     qty       = int(payload.get("quantity", LOT_SIZE))
@@ -1128,7 +1159,7 @@ def api_market_status():
     weekday = now_ist.weekday()
     if weekday >= 5:
         status = "CLOSED"
-    elif (hour == 9 and minute >= 15) or (10 <= hour < 15) or (hour == 15 and minute <= 15):
+    elif (hour == 9 and minute >= 15) or (10 <= hour < 15) or (hour == 15 and minute <= 25):
         status = "OPEN"
     elif hour == 9 and minute < 15:
         status = "PRE_OPEN"
@@ -1138,8 +1169,8 @@ def api_market_status():
         "status":           status,
         "current_time_ist": now_ist.strftime("%H:%M:%S"),
         "opens_at":         "09:15",
-        "closes_at":        "15:15",
-        "eod_auto_close":   "15:20",
+        "closes_at":        "15:25",
+        "eod_auto_close":   "15:30",
         "timezone":         "Asia/Kolkata",
         "is_weekday":       weekday < 5,
     })
@@ -1227,7 +1258,7 @@ def api_system_info():
         "uptime_seconds":          int(time.time() - START_TIME),
         "trading_enabled":         db.is_trading_enabled(TRADING_MODE),
         "scheduler":               "active" if scheduler else "inactive",
-        "eod_auto_close":          "15:20 IST weekdays",
+        "eod_auto_close":          "15:30 IST weekdays",
     })
 
 
@@ -1255,9 +1286,8 @@ if __name__ == "__main__":
     logger.info(f"Mode:    {TRADING_MODE}")
     logger.info(f"Capital: Rs.{INITIAL_CAPITAL:,.2f}")
     logger.info(f"Lot:     {LOT_SIZE} units")
-    logger.info("Intraday: entries blocked after 15:00 IST")
-    logger.info("EOD auto-close: 15:20 IST weekdays")
+    logger.info("Intraday: entries blocked after 15:10 IST")
+    logger.info("EOD auto-close: 15:30 IST weekdays")
     logger.info("=" * 60)
     notify_startup(INITIAL_CAPITAL, TRADING_MODE)
     app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
-    
