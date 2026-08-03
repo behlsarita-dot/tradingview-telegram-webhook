@@ -477,17 +477,43 @@ class DatabaseManager:
         where get_consecutive_losses() was originally missing option
         trades entirely). Takes an already-open cursor `c` so callers
         control the connection lifecycle - this does NOT open its own
-        get_cursor() block, and must always be called from inside one."""
+        get_cursor() block, and must always be called from inside one.
+
+        FIX (2026-08-03): previously had no date filter at all - it
+        ordered by exit_time DESC across ALL history for the mode, with
+        no lower bound. On a fresh process restart with zero trades
+        closed yet today, this meant the 3 most recent CLOSED trades
+        from days (even weeks) ago silently determined today's
+        consecutive-loss count before a single trade had happened in the
+        new session. Confirmed live 2026-08-03 09:20 IST: bot restarted
+        at 08:41, and _check_circuit_breakers() tripped at 09:20:13 off
+        three PAPER-mode losses from 2026-07-22/23/24 - the CE24400
+        BUY_OPTION at 09:20:01 was silently rejected inside
+        validate_new_trade() as a result, despite the webhook itself
+        returning 200. Since no new trade could ever open (rejected
+        before it could close and push the stale losses out of the
+        window), this was a self-sustaining lockout with no automatic
+        recovery.
+
+        Now scoped to exit_time falling on today's calendar date, same
+        DATE(exit_time::timestamp)=%s pattern already used in
+        get_daily_pnl() / get_trades_today() / get_validation_snapshot(),
+        so the loss streak - and the circuit breaker it feeds - resets
+        naturally every day instead of reaching back into arbitrary
+        history."""
+        today = datetime.now().strftime("%Y-%m-%d")
         c.execute("""
             SELECT pnl - total_charges as net_pnl, exit_time FROM (
                 SELECT pnl, total_charges, exit_time FROM positions
                 WHERE mode=%s AND status='CLOSED'
+                    AND exit_time IS NOT NULL AND DATE(exit_time::timestamp)=%s
                 UNION ALL
                 SELECT pnl, total_charges, exit_time FROM option_positions
                 WHERE mode=%s AND status='CLOSED'
+                    AND exit_time IS NOT NULL AND DATE(exit_time::timestamp)=%s
             ) t
             ORDER BY exit_time DESC LIMIT %s
-        """, (mode, mode, limit))
+        """, (mode, today, mode, today, limit))
         return c.fetchall()
 
     @staticmethod
@@ -815,6 +841,8 @@ class DatabaseManager:
         # can never silently drift apart again (see 2026-07-10 fix
         # history: this used to query `positions` only, missing every
         # option trade - the only kind the live bot actually places).
+        # As of 2026-08-03, also delegates the date-scoping fix in
+        # _get_recent_closed_trades() - see that method's docstring.
         with self.get_cursor() as c:
             rows = self._get_recent_closed_trades(c, mode, limit=20)
         return self._count_consecutive_losses(rows)
@@ -846,4 +874,3 @@ class DatabaseManager:
                 ) t
             """, (mode, today, mode, today))
             return c.fetchone()["cnt"] or 0
-        

@@ -110,16 +110,63 @@ class RiskManager:
             daily_pnl = snap["daily_pnl"]
             consec = snap["consecutive_losses"]
 
+        # NOTE (2026-08-03): the underlying consecutive-loss staleness
+        # bug (get_consecutive_losses() / get_validation_snapshot()
+        # reading all-time history with no date bound, tripping this
+        # breaker off days-old losses before any trade happened in the
+        # new session) is fixed in database.py's
+        # _get_recent_closed_trades() — see that method's docstring.
+        # This file didn't need to change for that fix; `consec` here
+        # now arrives already correctly scoped to today.
+
         if drawdown >= MAX_DRAWDOWN_PCT:
-            return False, f"Max drawdown {drawdown:.1f}% exceeded ({MAX_DRAWDOWN_PCT}%)"
+            reason = f"Max drawdown {drawdown:.1f}% exceeded ({MAX_DRAWDOWN_PCT}%)"
+            self._trip_circuit_breaker(reason, mode)
+            return False, reason
 
         if daily_pnl <= -abs(MAX_DAILY_LOSS):
-            return False, f"Daily loss limit Rs.{MAX_DAILY_LOSS:,.0f} reached"
+            reason = f"Daily loss limit Rs.{MAX_DAILY_LOSS:,.0f} reached"
+            self._trip_circuit_breaker(reason, mode)
+            return False, reason
 
         if consec >= MAX_CONSECUTIVE_LOSSES:
-            return False, f"{consec} consecutive losses (limit {MAX_CONSECUTIVE_LOSSES})"
+            reason = f"{consec} consecutive losses (limit {MAX_CONSECUTIVE_LOSSES})"
+            self._trip_circuit_breaker(reason, mode)
+            return False, reason
 
         return True, ""
+
+    def _trip_circuit_breaker(self, reason: str, mode: str):
+        """NEW (2026-08-03): previously a circuit-breaker trip only sent
+        a Telegram message (via notify_circuit_breaker() in app.py) and
+        silently rejected the individual signal — trading_enabled in the
+        account table never changed, so /api/kill-switch and
+        /api/system/info kept reporting trading_enabled=true throughout
+        an active trip, and every subsequent signal was rejected one at
+        a time with no persistent, visible state anywhere except
+        Telegram history.
+
+        This makes a trip an explicit, sticky halt: trading_enabled
+        flips to false with kill_switch_reason set, visible via
+        /api/kill-switch (GET) and /api/system/info, and it stays
+        halted until a deliberate POST to /api/kill-switch with
+        enabled=true — it will NOT silently clear itself just because
+        (for example) the date-scoped consecutive-loss window empties
+        out overnight.
+
+        This is a real behavior change from the pre-2026-08-03 system
+        (which had no persistent halt state at all for circuit-breaker
+        trips) — remove this method call from the three call sites
+        above in _check_circuit_breakers() if you'd rather trips remain
+        silent/self-clearing like before.
+
+        Only writes if not already disabled, so it doesn't overwrite a
+        reason already set by an earlier manual kill-switch call, and
+        doesn't spam updated_at on every single rejected signal while a
+        trip is already active."""
+        if self.db.is_trading_enabled(mode):
+            self.db.set_trading_enabled(False, mode, f"Circuit breaker: {reason}")
+            logger.warning(f"Circuit breaker tripped, trading halted: {reason}")
 
     def _calculate_drawdown(self, current_capital: float, mode: str = "PAPER") -> float:
         """Drawdown vs. a peak-capital high-water mark persisted in the
@@ -347,3 +394,4 @@ class RiskManager:
 
 def create_risk_manager(db, initial_capital: float = INITIAL_CAPITAL) -> RiskManager:
     return RiskManager(db, initial_capital)
+
