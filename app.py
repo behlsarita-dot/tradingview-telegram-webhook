@@ -438,9 +438,28 @@ def _refresh_health_cache():
 # at all - only Render's automated pinger does - so there's no user-
 # facing cost to no longer refreshing on every hit. /health and
 # /api/health now serve the cache as-is, refreshed once at startup (see
-# the call right after DatabaseManager() below) and on-demand via
+# the call right after DatabaseManager() below), on a background
+# schedule (see health_cache_refresh job, below), and on-demand via
 # /api/health/refresh, which is unchanged and still does a guaranteed-
 # fresh DB check when you actually want one.
+#
+# FIX (2026-08-04): the 2026-08-01 fix above stopped /health from ever
+# touching Neon again after startup, which fixed the quota problem but
+# introduced a new one: /health could keep reporting a stale "connected"
+# status indefinitely if Neon actually went down mid-day, since nothing
+# was refreshing the cache anymore. Two changes address this without
+# reintroducing the original per-ping DB touch:
+#   1. A "database_checked_seconds_ago" field is now included below, so
+#      an uptime monitor can alert on staleness (e.g. > 1200s) in
+#      addition to database != "connected" — this catches the case
+#      where the refresh job itself silently stops running.
+#   2. A background APScheduler job (health_cache_refresh, added right
+#      after the startup _refresh_health_cache() call below) refreshes
+#      the cache every 15 minutes on its own schedule, independent of
+#      Render's ping frequency. At 96 touches/day this is negligible
+#      against the 100 CU-hr/month quota, and unlike Render's ping (every
+#      few seconds) it can't ever prevent Neon's 5-min-idle autosuspend
+#      from kicking in between refreshes.
 @app.route("/health")
 @app.route("/api/health")
 def health():
@@ -451,6 +470,7 @@ def health():
         "mode":            TRADING_MODE,
         "timestamp":       ist_now(),
         "database":        _health_cache["database"],
+        "database_checked_seconds_ago": int(time.time() - _health_cache_updated_at),
         "telegram":        "enabled" if TELEGRAM_ENABLED else "disabled",
         "risk_manager":    "active" if ENABLE_RISK_MANAGEMENT else "disabled",
         "strategy":        "active" if STRATEGY_AVAILABLE else "fallback",
@@ -775,6 +795,22 @@ threading.Thread(target=_webhook_worker, daemon=True).start()
 # pings - see the FIX comment above the /health route for why this
 # matters. Use /api/health/refresh for a guaranteed-fresh read later.
 _refresh_health_cache()
+
+# NEW (2026-08-04): periodic background refresh of the health cache, so
+# /health can still detect a real Neon outage without depending on
+# Render's ping frequency (which no longer drives the cache — see the
+# FIX comment above the /health route). 15-minute interval = 96
+# touches/day, negligible against the 100 CU-hr/month quota, and short
+# enough to catch an outage promptly via the new
+# database_checked_seconds_ago field without ever preventing Neon's
+# 5-min-idle autosuspend between refreshes.
+if scheduler:
+    scheduler.add_job(
+        _refresh_health_cache,
+        trigger="interval", minutes=15,
+        id="health_cache_refresh", replace_existing=True
+    )
+    logger.info("Health cache background refresh scheduled: every 15 min")
 
 
 # ── Webhook ────────────────────────────────────────────────────────────────
