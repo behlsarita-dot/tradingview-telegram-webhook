@@ -321,10 +321,15 @@ def close_all_positions_eod(reason: str = "EOD Auto-Close 15:30"):
 
 # ── Scheduler ─────────────────────────────────────────────────────────────
 # NOTE: NSE extended F&O trading hours by 10 minutes (market close
-# 15:30 -> 15:40 IST) effective 2026-08-03. These three cron jobs are
-# shifted by the same 10 minutes (was 09:10 / 15:15 / 15:20) so each
-# keeps its original buffer relative to the actual close, matching the
-# _webhook_worker market-hours window below.
+# 15:30 -> 15:40 IST) effective 2026-08-03. The two close-side cron jobs
+# below (block_entries, eod_close) are shifted by the same 10 minutes
+# (was 15:15 / 15:20 -> now 15:25 / 15:30) so each keeps its original
+# buffer relative to the actual close, matching the _webhook_worker
+# market-hours window below (also shifted, see _MARKET_END_HOUR/_MIN).
+# enable_trading is anchored to the regular session open (09:15), which
+# NSE did NOT change, so its 09:10 pre-open buffer is unaffected and
+# intentionally left as-is — same reasoning applies to _MARKET_START_HOUR/
+# _MIN (9, 0) below, which also stayed put.
 
 def _eod_scheduler_job():
     """Scheduled EOD close — skips if kill switch was manually set by user."""
@@ -340,7 +345,9 @@ def _block_entries_job():
 
 
 def _enable_trading_job():
-    """Re-enable trading at 09:10 AM — fresh day."""
+    """Re-enable trading at 09:10 AM — fresh day. Anchored to the 09:15
+    session open (unchanged by the 2026-08-03 close-time extension), so
+    this stays at 09:10 — see scheduler NOTE above."""
     db.set_trading_enabled(True, TRADING_MODE, "")
     logger.info("Scheduler: trading enabled at 09:10")
     send_message("*Market Pre-Open*\nTrading enabled (09:10 IST)")
@@ -721,11 +728,13 @@ def api_close_position(pos_id):
 #
 # UPDATED (2026-08-01): NSE extended F&O trading hours by 10 minutes
 # (market close 15:30 -> 15:40 IST) effective 2026-08-03. Shifted this
-# window, plus the block-entries (15:15->15:25) and EOD-close
-# (15:20->15:30) scheduler jobs above, and the hardcoded 15:00 cutoff in
-# _handle_open(), by the same 10 minutes so each keeps its original
-# buffer relative to the actual close instead of that buffer silently
-# shrinking to zero.
+# window's end (15:30 -> 15:40), plus the block-entries (15:15->15:25)
+# and EOD-close (15:20->15:30) scheduler jobs above, and the hardcoded
+# 15:00 cutoff in _handle_open() (->15:10), by the same 10 minutes so
+# each keeps its original buffer relative to the actual close instead of
+# that buffer silently shrinking to zero. The window's start (09:00) and
+# the enable_trading job (09:10) are anchored to the unchanged 09:15
+# session open and were intentionally left as-is.
 
 _WORKER_POLL_INTERVAL_SECONDS = 0.5
 _WEEKEND_SLEEP_SECONDS = 1800   # 30 min - just needs to notice Monday arrived
