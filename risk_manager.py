@@ -19,6 +19,30 @@ from config import (
 
 logger = logging.getLogger(__name__)
 
+# FIX (2026-08-05): confirmed live on NIFTY260818P24500, 2026-08-05
+# 11:35:07 IST — a BUY_OPTION signal with a genuinely symmetric 10-point
+# SL/TP (entry - slPoints / entry + tpPoints, from the Pine script's
+# fixed slPoints=10.0/tpPoints=10.0 inputs) was rejected with
+# "R:R 1.00 below minimum 1.0". The displayed value (rr rounded to 2dp)
+# and the actual comparison value disagreed: `entry - sl` and
+# `tp - entry` are algebraically identical (both equal to the same fixed
+# point offset) but are NOT guaranteed to produce bit-identical binary
+# floating-point results — e.g. entry=126.5734 gives
+# risk=abs(entry-sl)=10.0 exactly, but reward=abs(tp-entry)=
+# 9.999999999999986, so rr=0.9999999999999986. That fails a strict
+# `rr < MIN_RISK_REWARD_RATIO` (1.0) check while `f"{rr:.2f}"` still
+# prints a clean "1.00", producing exactly the confusing
+# "1.00 below minimum 1.0" message seen in Telegram. Reproduced this by
+# sweeping 200,000 random entry premiums through entry±10.0: ~2% (4,350)
+# landed on the wrong side of exact 10.0 purely from float rounding —
+# not a rare edge case, an intermittent one that any symmetric-offset
+# script (like this one) will keep hitting unpredictably. A tiny epsilon
+# tolerance below is applied to the comparison only, so a genuinely
+# sub-minimum R:R (e.g. 0.8) is still rejected exactly as before —
+# 1e-9 is far larger than the ~1e-15 float error above but far smaller
+# than any real trading R:R difference.
+_RR_EPSILON = 1e-9
+
 
 class RiskManager:
     def __init__(self, db, initial_capital: float = INITIAL_CAPITAL):
@@ -77,7 +101,14 @@ class RiskManager:
             reward = abs(tp - entry)
             if risk > 0:
                 rr = reward / risk
-                if rr < MIN_RISK_REWARD_RATIO:
+                # FIX (2026-08-05): epsilon tolerance — see _RR_EPSILON
+                # comment at top of file. A symmetric-offset R:R that is
+                # mathematically exactly at the minimum can land a hair
+                # below it in binary floating point (e.g. 0.9999999999999986
+                # instead of 1.0); without this tolerance that gets
+                # rejected while the rounded display still reads "1.00",
+                # producing a confusing false rejection.
+                if rr < MIN_RISK_REWARD_RATIO - _RR_EPSILON:
                     return False, {
                         "message": f"R:R {rr:.2f} below minimum {MIN_RISK_REWARD_RATIO}",
                         "rr_ratio": round(rr, 2)
@@ -394,4 +425,3 @@ class RiskManager:
 
 def create_risk_manager(db, initial_capital: float = INITIAL_CAPITAL) -> RiskManager:
     return RiskManager(db, initial_capital)
-
