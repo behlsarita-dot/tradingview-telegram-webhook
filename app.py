@@ -463,10 +463,27 @@ def _refresh_health_cache():
 #   2. A background APScheduler job (health_cache_refresh, added right
 #      after the startup _refresh_health_cache() call below) refreshes
 #      the cache every 15 minutes on its own schedule, independent of
-#      Render's ping frequency. At 96 touches/day this is negligible
-#      against the 100 CU-hr/month quota, and unlike Render's ping (every
-#      few seconds) it can't ever prevent Neon's 5-min-idle autosuspend
-#      from kicking in between refreshes.
+#      Render's ping frequency.
+#
+# FIX (2026-08-06): the 2026-08-04 fix assumed 96 touches/day was
+# "negligible against the 100 CU-hr/month quota" and left this job
+# running unconditionally, 24/7, including nights and weekends. That
+# assumption undercounted the real cost: Neon's 5-minute idle-suspend
+# timer resets on EACH wake regardless of how fast the query itself
+# completes, so every touch forces up to ~5 min of billed active compute
+# - not the sub-second cost the query itself takes. Confirmed via System
+# Operations log 2026-08-05/06: Start->Suspend cycles every ~15 min,
+# ~5-6 min active each, continuously overnight - roughly 8 hrs/day of
+# active compute from a job whose actual DB work is milliseconds, none
+# of it during trading hours. The job registration below now calls
+# _scheduled_health_refresh() (defined further down, after
+# _is_trading_day()/_is_market_hours() exist) instead of
+# _refresh_health_cache() directly, so the DB is only actually touched
+# 09:00-15:40 IST Mon-Fri - mirroring the same gating _webhook_worker
+# already uses. Outside that window database_checked_seconds_ago simply
+# grows, which is exactly the field the 2026-08-04 fix added so a
+# staleness monitor can still catch a genuine outage without requiring a
+# live touch every 15 min around the clock.
 @app.route("/health")
 @app.route("/api/health")
 def health():
@@ -805,21 +822,36 @@ threading.Thread(target=_webhook_worker, daemon=True).start()
 # matters. Use /api/health/refresh for a guaranteed-fresh read later.
 _refresh_health_cache()
 
-# NEW (2026-08-04): periodic background refresh of the health cache, so
-# /health can still detect a real Neon outage without depending on
-# Render's ping frequency (which no longer drives the cache — see the
-# FIX comment above the /health route). 15-minute interval = 96
-# touches/day, negligible against the 100 CU-hr/month quota, and short
-# enough to catch an outage promptly via the new
-# database_checked_seconds_ago field without ever preventing Neon's
-# 5-min-idle autosuspend between refreshes.
+
+# NEW (2026-08-06): market-hours gate for the health_cache_refresh job.
+# Defined here (after _is_trading_day()/_is_market_hours() above) rather
+# than up near _refresh_health_cache() near the /health route, purely so
+# both names already exist by the time this function is defined - avoids
+# any dependency on definition order elsewhere in the file. See the FIX
+# (2026-08-06) comment above the /health route for the full reasoning:
+# each DB touch forces up to ~5 min of billed active compute regardless
+# of query speed, so a 15-min unconditional job was costing roughly
+# 8 hrs/day of active compute around the clock, most of it outside
+# trading hours where nothing meaningful changes anyway (trading_enabled
+# only flips via the 09:10/15:25 cron jobs above, which run independently
+# of this). Skipping the refresh outside market hours leaves
+# database_checked_seconds_ago to grow instead - the field the 2026-08-04
+# fix added specifically so a staleness monitor can still catch a real
+# outage without a live touch every 15 min.
+def _scheduled_health_refresh():
+    now_ist = datetime.now(IST)
+    if not _is_trading_day(now_ist) or not _is_market_hours(now_ist):
+        return
+    _refresh_health_cache()
+
+
 if scheduler:
     scheduler.add_job(
-        _refresh_health_cache,
+        _scheduled_health_refresh,
         trigger="interval", minutes=15,
         id="health_cache_refresh", replace_existing=True
     )
-    logger.info("Health cache background refresh scheduled: every 15 min")
+    logger.info("Health cache background refresh scheduled: every 15 min (market hours only, 09:00-15:40 IST Mon-Fri)")
 
 
 # ── Webhook ────────────────────────────────────────────────────────────────
