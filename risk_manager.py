@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """
-Risk Manager - Paper Trading System v7.0
+Risk Manager - Paper Trading System v7.1
+
+CHANGE LOG (v7.1, 2026-08-10):
+Added a scoped auto-clear for circuit breaker trips caused SPECIFICALLY by
+consecutive losses. See _maybe_auto_clear_consecutive_loss_halt() below for
+the full rationale. Drawdown trips and daily-loss trips are UNCHANGED and
+remain fully sticky/manual, per the original v7.0 design intent.
 """
 
 import logging
@@ -43,6 +49,12 @@ logger = logging.getLogger(__name__)
 # than any real trading R:R difference.
 _RR_EPSILON = 1e-9
 
+# NEW (2026-08-10): prefix used to identify consecutive-loss trips inside
+# kill_switch_reason, so the auto-clear logic only ever matches trips it
+# is explicitly allowed to touch. Any other reason string (drawdown,
+# daily loss, or a manual halt with a custom message) is left alone.
+_CONSECUTIVE_LOSS_TRIP_MARKER = "consecutive losses"
+
 
 class RiskManager:
     def __init__(self, db, initial_capital: float = INITIAL_CAPITAL):
@@ -70,6 +82,14 @@ class RiskManager:
         account = snap["account"]
         if not account:
             return False, {"message": "Account not found"}
+
+        # NEW (2026-08-10): before honoring a kill switch, check whether
+        # it's a consecutive-loss trip that has become stale (today's
+        # date-scoped counter is back under the limit) and auto-clear it
+        # if so. Mutates `account` in place so every read below (kill
+        # switch check, circuit breaker check) sees the cleared state
+        # within this same request.
+        self._maybe_auto_clear_consecutive_loss_halt(account, snap, mode)
 
         # Kill switch check — blocks all new entries
         trading_enabled = bool(account.get("trading_enabled", 1))
@@ -125,6 +145,86 @@ class RiskManager:
             "open_positions": len(all_open)
         }
 
+    def _maybe_auto_clear_consecutive_loss_halt(self, account: Dict,
+                                                  snap: Dict = None,
+                                                  mode: str = "PAPER") -> bool:
+        """NEW (2026-08-10): scoped auto-clear for consecutive-loss trips.
+
+        BACKGROUND: as of the 2026-08-03 change, ANY circuit breaker trip
+        (drawdown, daily loss, OR consecutive losses) sets a sticky
+        trading_enabled=False that persists until a manual POST to
+        /api/kill-switch with enabled=true — by design, so a trip never
+        silently self-clears just because a date-scoped window empties out
+        overnight.
+
+        PROBLEM: get_consecutive_losses() / the validation snapshot's
+        consecutive_losses field IS date-scoped (per the 2026-08-03
+        database.py fix). So the day after a consecutive-losses trip, the
+        counter correctly reads 0 (no losses yet today) while
+        trading_enabled is still False from yesterday's trip — the two
+        pieces of state disagree, and trading stays blocked indefinitely
+        with no automatic path back even though the condition that caused
+        the trip no longer holds.
+
+        FIX: on every validate_new_trade() call, if the account is halted
+        AND the halt reason is specifically a consecutive-losses trip (as
+        identified by _CONSECUTIVE_LOSS_TRIP_MARKER in the stored reason
+        string) AND today's date-scoped consecutive-loss count is now
+        below MAX_CONSECUTIVE_LOSSES, clear the halt via
+        set_trading_enabled(True, ...) and mutate the in-memory `account`
+        dict so the rest of THIS request sees the cleared state too.
+
+        SCOPE, DELIBERATELY NARROW:
+        - Drawdown trips are untouched — a drawdown halt has nothing to do
+          with today's date, so there is no "staleness" for it to recover
+          from automatically. Still requires manual clear.
+        - Daily-loss trips are untouched for the same reason — MAX_DAILY_LOSS
+          resets are a separate daily-P&L concern, not modeled here, so
+          leaving this manual avoids accidentally re-enabling trading on a
+          bad day just because of how P&L is being read.
+        - A manual halt (trading disabled via a direct kill-switch POST with
+          a custom reason that doesn't contain the marker string) is never
+          auto-cleared, regardless of what the consecutive-loss counter
+          says.
+        - Only fires from validate_new_trade()'s snapshot path (this method
+          takes an already-fetched `account` dict + optional `snap`). If
+          `snap` is None it fetches today's consecutive-loss count directly
+          so get_risk_report() (which calls _check_circuit_breakers with
+          snap=None) also benefits and reports consistent state.
+
+        Returns True if it cleared the halt, False otherwise (no
+        behavioral action needed by callers — they just re-read
+        `account["trading_enabled"]` after calling this).
+        """
+        trading_enabled = bool(account.get("trading_enabled", 1))
+        if trading_enabled:
+            return False  # nothing to clear
+
+        reason = account.get("kill_switch_reason") or ""
+        if _CONSECUTIVE_LOSS_TRIP_MARKER not in reason.lower():
+            return False  # not a consecutive-loss trip — leave it alone
+
+        consec = snap["consecutive_losses"] if snap is not None \
+            else self.db.get_consecutive_losses(mode)
+
+        if consec >= MAX_CONSECUTIVE_LOSSES:
+            return False  # still genuinely at/above the limit today
+
+        logger.info(
+            f"Auto-clearing consecutive-loss circuit breaker for {mode}: "
+            f"today's count ({consec}) is below limit ({MAX_CONSECUTIVE_LOSSES}). "
+            f"Previous reason: {reason!r}"
+        )
+        self.db.set_trading_enabled(True, mode, None)
+
+        # Reflect the clear in the in-memory dict immediately, so the
+        # remainder of THIS validate_new_trade() call (and get_risk_report(),
+        # which reads trading_enabled again after calling this) sees it
+        # without needing a second DB round trip.
+        account["trading_enabled"] = True
+        account["kill_switch_reason"] = None
+        return True
+
     def _check_circuit_breakers(self, account: Dict, snap: Dict = None,
                                  mode: str = "PAPER") -> Tuple[bool, str]:
         capital = account["current_capital"]
@@ -149,6 +249,10 @@ class RiskManager:
         # _get_recent_closed_trades() — see that method's docstring.
         # This file didn't need to change for that fix; `consec` here
         # now arrives already correctly scoped to today.
+        #
+        # NOTE (2026-08-10): that date-scoping fix is exactly what makes
+        # the NEW _maybe_auto_clear_consecutive_loss_halt() above safe to
+        # trust — it reads the same correctly-scoped `consec` value.
 
         if drawdown >= MAX_DRAWDOWN_PCT:
             reason = f"Max drawdown {drawdown:.1f}% exceeded ({MAX_DRAWDOWN_PCT}%)"
@@ -168,28 +272,19 @@ class RiskManager:
         return True, ""
 
     def _trip_circuit_breaker(self, reason: str, mode: str):
-        """NEW (2026-08-03): previously a circuit-breaker trip only sent
-        a Telegram message (via notify_circuit_breaker() in app.py) and
-        silently rejected the individual signal — trading_enabled in the
-        account table never changed, so /api/kill-switch and
-        /api/system/info kept reporting trading_enabled=true throughout
-        an active trip, and every subsequent signal was rejected one at
-        a time with no persistent, visible state anywhere except
-        Telegram history.
+        """A circuit-breaker trip sends a Telegram message (via
+        notify_circuit_breaker() in app.py) AND makes the halt an explicit,
+        sticky state: trading_enabled flips to false with kill_switch_reason
+        set, visible via /api/kill-switch (GET) and /api/system/info.
 
-        This makes a trip an explicit, sticky halt: trading_enabled
-        flips to false with kill_switch_reason set, visible via
-        /api/kill-switch (GET) and /api/system/info, and it stays
-        halted until a deliberate POST to /api/kill-switch with
-        enabled=true — it will NOT silently clear itself just because
-        (for example) the date-scoped consecutive-loss window empties
-        out overnight.
-
-        This is a real behavior change from the pre-2026-08-03 system
-        (which had no persistent halt state at all for circuit-breaker
-        trips) — remove this method call from the three call sites
-        above in _check_circuit_breakers() if you'd rather trips remain
-        silent/self-clearing like before.
+        As of v7.1 (2026-08-10), a trip stays halted until EITHER:
+          (a) a deliberate POST to /api/kill-switch with enabled=true, OR
+          (b) for consecutive-loss trips specifically, the next call to
+              validate_new_trade() finds today's date-scoped consecutive-
+              loss count back under MAX_CONSECUTIVE_LOSSES — see
+              _maybe_auto_clear_consecutive_loss_halt().
+        Drawdown and daily-loss trips are unaffected by (b) and remain
+        (a)-only, same as the original v7.0 behavior.
 
         Only writes if not already disabled, so it doesn't overwrite a
         reason already set by an earlier manual kill-switch call, and
@@ -313,6 +408,13 @@ class RiskManager:
         if not account:
             return {"can_trade": False, "error": "Account not found"}
 
+        # NEW (2026-08-10): apply the same scoped auto-clear here so
+        # /api/system/info and check_risk.py never show a stale
+        # consecutive-loss halt that validate_new_trade() would already
+        # have cleared on the next real trade attempt. snap=None here, so
+        # this internally fetches today's consecutive-loss count itself.
+        self._maybe_auto_clear_consecutive_loss_halt(account, None, mode)
+
         capital = account["current_capital"]
         drawdown = self._calculate_drawdown(capital, mode)
         daily_pnl = self.db.get_daily_pnl(mode)
@@ -320,7 +422,7 @@ class RiskManager:
         open_pos = self.db.get_open_positions(mode) + self.db.get_open_option_positions(mode)
         heat = self._calculate_portfolio_heat(open_pos, capital)
         multiplier = self._size_multiplier(capital, mode)
-        trading_enabled = self.db.is_trading_enabled(mode)
+        trading_enabled = bool(account.get("trading_enabled", 1))
 
         can_trade, cb_reason = self._check_circuit_breakers(account, None, mode)
 
