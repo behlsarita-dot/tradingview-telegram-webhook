@@ -353,12 +353,55 @@ def _enable_trading_job():
     send_message("*Market Pre-Open*\nTrading enabled (09:10 IST)")
 
 
+# NEW (2026-08-11): confirmed live on NIFTY260818P24500 - a TP
+# EXIT_OPTION fired at 09:20:02 IST (5 min after the 09:00 market-hours
+# gate opens) and reached pending_webhooks fine (created_at=09:20:02,
+# processed cleanly by 09:20:09 — see check_pending_webhook.py id=75),
+# but TradingView's own delivery log still reported "request took too
+# long and timed out" for that call. Since the fast-path /api/webhook
+# route does nothing but validate + a single INSERT before responding
+# (see FIX 2026-07-14 above api_webhook()), a >3s round trip there
+# almost certainly means the INSERT itself was slow - and the likely
+# cause is Neon cold-start latency: the market-hours gate
+# (2026-07-27/2026-08-06 fixes) correctly lets the compute suspend
+# every night and all weekend, which means the FIRST real DB touch each
+# trading day pays a wake-from-suspend penalty, right when an early
+# signal may already be waiting.
+#
+# This job fires at 08:58 IST - 2 min before _webhook_worker's own
+# 09:00 gate opens, and well before the 09:15 session open where a real
+# signal is likely - and does one lightweight read purely to force Neon
+# awake ahead of time, so the compute is already warm by the time a
+# genuine webhook can arrive. Costs a small, predictable amount of
+# extra active-compute time each trading morning in exchange for
+# removing this race on the day's first signal.
+#
+# Deliberately does NOT call _is_trading_day() here (that function is
+# defined much further down the file, near _webhook_worker, and calling
+# it from here — before start_scheduler() has even run — would risk a
+# NameError depending on definition order). The day_of_week="mon-fri"
+# constraint on the add_job() call below already guarantees this never
+# fires on Sat/Sun, so a second Python-side weekday check would be pure
+# duplication, not extra safety.
+def _warm_neon_job():
+    try:
+        db.get_account(TRADING_MODE)
+        logger.info("Scheduler: Neon warm-up touch at 08:58 IST")
+    except Exception as e:
+        logger.warning(f"Neon warm-up touch failed (non-fatal): {e}")
+
+
 def start_scheduler():
     try:
         from apscheduler.schedulers.background import BackgroundScheduler
 
         scheduler = BackgroundScheduler(timezone=IST)
 
+        scheduler.add_job(
+            _warm_neon_job,
+            trigger="cron", hour=8, minute=58,
+            day_of_week="mon-fri", id="warm_neon", replace_existing=True
+        )
         scheduler.add_job(
             _eod_scheduler_job,
             trigger="cron", hour=15, minute=30,
@@ -376,7 +419,7 @@ def start_scheduler():
         )
 
         scheduler.start()
-        logger.info("Scheduler started: enable 09:10 | block 15:25 | EOD close 15:30 IST")
+        logger.info("Scheduler started: warm 08:58 | enable 09:10 | block 15:25 | EOD close 15:30 IST")
         return scheduler
 
     except Exception as e:
