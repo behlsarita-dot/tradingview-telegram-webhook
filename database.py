@@ -23,6 +23,7 @@ Requires env var: DATABASE_URL - the Neon connection string, e.g.
 import os
 import json
 import logging
+import threading
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta
@@ -48,6 +49,12 @@ class DatabaseManager:
             )
         self.db_url = db_url
         self._init_db()
+        # NEW (2026-08-14): dedicated connection + lock for enqueue_webhook()
+        # only - see _get_enqueue_connection() docstring below for why this
+        # one method gets different treatment from every other get_cursor()
+        # call in this file.
+        self._enqueue_conn = None
+        self._enqueue_conn_lock = threading.Lock()
 
     @contextmanager
     def get_cursor(self):
@@ -368,20 +375,110 @@ class DatabaseManager:
     # PENDING WEBHOOKS (persisted queue — replaces in-memory queue.Queue())
     # ------------------------------------------------------------------ #
 
+    def _get_enqueue_connection(self):
+        """Returns a persistent connection reserved for enqueue_webhook()
+        only, reused across calls instead of opening a fresh one every
+        time (see get_cursor() above for why every OTHER method still
+        deliberately does open fresh, unpooled connections - that
+        reasoning still holds everywhere else).
+
+        NEW (2026-08-14): confirmed live on NIFTY260818P24500/C24700,
+        2026-08-11 - three separate webhook deliveries (09:20, 15:05,
+        15:20 IST) all timed out client-side on TradingView's end, despite
+        the underlying pending_webhooks INSERT completing correctly
+        seconds later (see check_pending_webhook.py ids 75/76/77 - all
+        status=PROCESSED, no data lost). All three happened well after
+        market open, ruling out overnight/weekend cold start as the sole
+        cause (the 08:58 IST _warm_neon_job in app.py already covers
+        that case), and gunicorn.conf.py already runs threads=4 with
+        healthy queue latency elsewhere in the system, ruling out thread
+        contention too. The remaining variable is get_cursor()'s per-call
+        psycopg2.connect(): enqueue_webhook() is the one synchronous DB
+        call sitting directly inside TradingView's 3-second window (see
+        FIX 2026-07-14 above api_webhook() in app.py), and a fresh
+        TCP+TLS+auth handshake has no floor on how long it can
+        occasionally take - enough, apparently, to exceed 3s even on an
+        already-warm compute.
+
+        This is intentionally narrow: ONLY enqueue_webhook() uses this.
+        It's still a single connection, not a pool sized for concurrency,
+        so the compute-hour cost is minimal - during a long idle stretch
+        (overnight/weekend) Neon may still drop or suspend this
+        connection same as any other; the code below just detects that
+        and reconnects once, lazily, on the next call, rather than paying
+        a fresh handshake on every single call the way get_cursor() does.
+        Guarded by self._enqueue_conn_lock because gunicorn.conf.py runs
+        threads=4, so more than one Flask request thread can call
+        enqueue_webhook() concurrently, and a psycopg2 connection is not
+        safe for concurrent use from multiple threads at once."""
+        if self._enqueue_conn is not None:
+            try:
+                if self._enqueue_conn.closed == 0:
+                    return self._enqueue_conn
+            except Exception:
+                pass
+            try:
+                self._enqueue_conn.close()
+            except Exception:
+                pass
+            self._enqueue_conn = None
+
+        self._enqueue_conn = psycopg2.connect(
+            self.db_url, sslmode="require", connect_timeout=8
+        )
+        return self._enqueue_conn
+
     def enqueue_webhook(self, mode: str, action: str, symbol: str, payload: dict) -> int:
         """Called synchronously from /api/webhook, before the 200 is
         returned. A single INSERT - no risk validation, no position
         writes - so it stays fast enough to not reintroduce the
         TradingView 3-second timeout the background-thread fix (2026-07-14)
-        was built to avoid."""
+        was built to avoid.
+
+        UPDATED (2026-08-14): uses a dedicated, lazily-reconnecting
+        persistent connection (_get_enqueue_connection()) instead of
+        get_cursor()'s per-call psycopg2.connect(), specifically because
+        this call sits directly inside TradingView's 3-second window - see
+        _get_enqueue_connection() docstring for the full reasoning and the
+        2026-08-11 evidence that motivated this change. Every other method
+        in this file is unaffected and keeps using get_cursor() as before."""
         now = datetime.now().isoformat()
-        with self.get_cursor() as c:
-            c.execute("""
-                INSERT INTO pending_webhooks (mode, action, symbol, payload, status, created_at)
-                VALUES (%s, %s, %s, %s, 'PENDING', %s)
-                RETURNING id
-            """, (mode, action, symbol, json.dumps(payload), now))
-            return c.fetchone()["id"]
+        with self._enqueue_conn_lock:
+            conn = self._get_enqueue_connection()
+            cursor = None
+            try:
+                cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+                cursor.execute("""
+                    INSERT INTO pending_webhooks (mode, action, symbol, payload, status, created_at)
+                    VALUES (%s, %s, %s, %s, 'PENDING', %s)
+                    RETURNING id
+                """, (mode, action, symbol, json.dumps(payload), now))
+                row = cursor.fetchone()
+                conn.commit()
+                return row["id"]
+            except Exception:
+                # Connection may be broken (e.g. Neon dropped it after a
+                # long idle period, or a network blip) - roll back, close
+                # it, and clear it so the NEXT call reconnects fresh
+                # rather than repeatedly failing against a dead
+                # connection. Re-raised so app.py's existing exception
+                # handling in api_webhook() is unchanged.
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                self._enqueue_conn = None
+                raise
+            finally:
+                if cursor is not None:
+                    try:
+                        cursor.close()
+                    except Exception:
+                        pass
 
     def claim_next_pending_webhook(self, mode: str = "PAPER") -> Optional[Dict]:
         """Atomically claims the oldest PENDING row for this mode and
