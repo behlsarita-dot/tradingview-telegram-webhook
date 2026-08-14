@@ -1,0 +1,25 @@
+name: Trigger Render Deploy
+
+# Fallback deploy trigger (added 2026-08-14): Render's GitHub App auto-deploy
+# stopped firing on push to main (confirmed via a test empty commit that
+# landed on GitHub but never started a Render deploy), while manually
+# calling the Deploy Hook worked fine - so the break is specifically in
+# GitHub App -> Render webhook delivery, not Render's deploy pipeline
+# itself. This workflow calls the Deploy Hook directly on every push to
+# main, bypassing that broken path entirely. Safe to remove once Render's
+# native auto-deploy is confirmed reliable again over several pushes.
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call Render Deploy Hook
+        run: |
+          curl -X POST "${{ secrets.RENDER_DEPLOY_HOOK }}" \
+            --fail \
+            --silent \
+            --show-error
