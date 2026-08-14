@@ -24,6 +24,7 @@ import os
 import json
 import logging
 import threading
+import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta
@@ -423,9 +424,17 @@ class DatabaseManager:
                 pass
             self._enqueue_conn = None
 
+        # TEMP INSTRUMENTATION (2026-08-14): timing a fresh connect so we
+        # can see cold-start/handshake cost directly in logs whenever this
+        # branch is hit (first call, or reconnect after a dropped/suspended
+        # connection) rather than only inferring it from a timeout. Remove
+        # once the persistent-connection fix above is confirmed sufficient.
+        _t0 = time.monotonic()
         self._enqueue_conn = psycopg2.connect(
             self.db_url, sslmode="require", connect_timeout=8
         )
+        _elapsed = time.monotonic() - _t0
+        logger.info(f"WEBHOOK_TIMING fresh_connect={_elapsed:.2f}s")
         return self._enqueue_conn
 
     def enqueue_webhook(self, mode: str, action: str, symbol: str, payload: dict) -> int:
@@ -443,11 +452,22 @@ class DatabaseManager:
         2026-08-11 evidence that motivated this change. Every other method
         in this file is unaffected and keeps using get_cursor() as before."""
         now = datetime.now().isoformat()
+        # TEMP INSTRUMENTATION (2026-08-14): wall-clock timing around
+        # connection acquisition vs. the query itself, so a slow call
+        # shows up in logs as WEBHOOK_TIMING with a breakdown, instead of
+        # only surfacing as a client-side timeout on TradingView's end
+        # with no visibility into which part was slow. Remove once the
+        # persistent-connection fix is confirmed sufficient over a few
+        # trading days.
+        _t_start = time.monotonic()
         with self._enqueue_conn_lock:
+            _t_conn0 = time.monotonic()
             conn = self._get_enqueue_connection()
+            _conn_time = time.monotonic() - _t_conn0
             cursor = None
             try:
                 cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+                _t_query0 = time.monotonic()
                 cursor.execute("""
                     INSERT INTO pending_webhooks (mode, action, symbol, payload, status, created_at)
                     VALUES (%s, %s, %s, %s, 'PENDING', %s)
@@ -455,6 +475,13 @@ class DatabaseManager:
                 """, (mode, action, symbol, json.dumps(payload), now))
                 row = cursor.fetchone()
                 conn.commit()
+                _query_time = time.monotonic() - _t_query0
+                _total = time.monotonic() - _t_start
+                logger.info(
+                    f"WEBHOOK_TIMING conn_acquire={_conn_time:.2f}s "
+                    f"query={_query_time:.2f}s total={_total:.2f}s "
+                    f"webhook_id={row['id']}"
+                )
                 return row["id"]
             except Exception:
                 # Connection may be broken (e.g. Neon dropped it after a
