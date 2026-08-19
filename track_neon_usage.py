@@ -21,9 +21,15 @@ USAGE
     python track_neon_usage.py
         No new reading - just shows the log history and deltas so far.
 
+    python track_neon_usage.py --delete-last
+        Removes the single most recent entry (e.g. you fat-fingered a
+        duplicate/wrong number and want to redo it) without wiping the
+        whole log. Prints what was removed for confirmation.
+
     python track_neon_usage.py --reset
-        Wipes the log (e.g. if you want to start fresh after a new
-        billing period begins, since Neon's own total resets monthly).
+        Wipes the entire log (e.g. if you want to start fresh after a
+        new billing period begins, since Neon's own total resets
+        monthly).
 """
 
 import sys
@@ -90,13 +96,28 @@ def main():
     ap = argparse.ArgumentParser(description="Log and track Neon compute-hour usage over time")
     ap.add_argument("cu_hours", nargs="?", type=float,
                      help="Current 'Compute X / 100CU-hrs' reading from the Neon dashboard")
-    ap.add_argument("--reset", action="store_true", help="Wipe the log and start fresh")
+    ap.add_argument("--reset", action="store_true", help="Wipe the entire log and start fresh")
+    ap.add_argument("--delete-last", action="store_true",
+                     help="Remove only the most recent entry (e.g. to fix a fat-fingered/duplicate reading)")
     args = ap.parse_args()
 
     if args.reset:
         if LOG_PATH.exists():
             LOG_PATH.unlink()
         print(f"Log reset. {LOG_PATH.name} removed.")
+        return
+
+    if args.delete_last:
+        entries = load_log()
+        if not entries:
+            print("Log is already empty - nothing to delete.")
+            return
+        removed = entries.pop()
+        save_log(entries)
+        ts = datetime.fromisoformat(removed["timestamp"])
+        print(f"Removed most recent entry: {ts.strftime('%Y-%m-%d %H:%M')}  "
+              f"{removed['cu_hours']:.2f} CU-hrs")
+        print_history(entries)
         return
 
     entries = load_log()
