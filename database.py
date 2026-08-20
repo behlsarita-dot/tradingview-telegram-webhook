@@ -73,7 +73,37 @@ class DatabaseManager:
         # comment above api_webhook() in app.py for the actual fix
         # (respond to TradingView immediately, do this connection/query
         # work afterwards on a background thread).
-        conn = psycopg2.connect(self.db_url, sslmode="require", connect_timeout=8)
+        #
+        # NEW (2026-08-20): retry the connect() itself, up to 2 extra
+        # attempts with short backoff, on psycopg2.OperationalError.
+        # Confirmed live 2026-08-20 09:44:43 IST: the pending_webhooks
+        # poller failed with "server closed the connection unexpectedly /
+        # SSL SYSCALL error: Connection reset by peer" - psycopg2's
+        # signature for a failure DURING connect() against Neon's pooler,
+        # not a stale-connection-reused-mid-query issue (this method
+        # never reuses connections, so that class of bug doesn't apply
+        # here). Self-healed on the next poll tick, but that still means
+        # one full cycle's worth of latency on a live BUY/EXIT signal.
+        # Only retries connect() itself - if the query/commit fails after
+        # a connection is successfully established, that's a real error
+        # and still propagates immediately as before.
+        last_err = None
+        conn = None
+        for attempt in range(3):
+            try:
+                conn = psycopg2.connect(self.db_url, sslmode="require", connect_timeout=8)
+                break
+            except psycopg2.OperationalError as e:
+                last_err = e
+                if attempt < 2:
+                    logger.warning(
+                        f"get_cursor: connect attempt {attempt + 1} failed "
+                        f"({e.__class__.__name__}), retrying in {0.5 * (attempt + 1):.1f}s"
+                    )
+                    time.sleep(0.5 * (attempt + 1))
+        if conn is None:
+            raise last_err
+
         cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         try:
             yield cursor
