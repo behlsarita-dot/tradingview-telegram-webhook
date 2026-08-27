@@ -40,6 +40,11 @@ from datetime import datetime
 
 LOG_PATH = Path(__file__).parent / "neon_usage_log.json"
 
+CAP_CU_HRS = 100.0        # Neon free-tier compute-hour cap
+WARN_THRESHOLD = 80.0     # warn once cumulative usage crosses this
+TRAILING_WINDOW = 7       # number of most recent readings to use for the "recent pace" rate
+RUNWAY_WARN_DAYS = 14     # also warn if projected runway drops under this many days
+
 
 def load_log():
     if not LOG_PATH.exists():
@@ -55,6 +60,47 @@ def load_log():
 def save_log(entries):
     with open(LOG_PATH, "w") as f:
         json.dump(entries, f, indent=2)
+
+
+def print_cap_projection(entries):
+    """Show remaining budget and days-to-cap projections, with a warning
+    if usage is getting close to the 100 CU-hr free-tier cap."""
+    if len(entries) < 2:
+        return  # not enough data to project a rate yet
+
+    cumulative = entries[-1]["cu_hours"]
+    remaining = CAP_CU_HRS - cumulative
+
+    first_ts = datetime.fromisoformat(entries[0]["timestamp"])
+    last_ts = datetime.fromisoformat(entries[-1]["timestamp"])
+    total_delta = entries[-1]["cu_hours"] - entries[0]["cu_hours"]
+    total_hours = (last_ts - first_ts).total_seconds() / 3600
+    overall_rate = (total_delta / total_hours) * 24 if total_hours > 0 else 0
+
+    # Trailing-window rate, using only the last TRAILING_WINDOW readings
+    window = entries[-TRAILING_WINDOW:] if len(entries) > TRAILING_WINDOW else entries
+    w_first_ts = datetime.fromisoformat(window[0]["timestamp"])
+    w_last_ts = datetime.fromisoformat(window[-1]["timestamp"])
+    w_delta = window[-1]["cu_hours"] - window[0]["cu_hours"]
+    w_hours = (w_last_ts - w_first_ts).total_seconds() / 3600
+    trailing_rate = (w_delta / w_hours) * 24 if w_hours > 0 else None
+
+    days_left_overall = (remaining / overall_rate) if overall_rate > 0 else float("inf")
+    days_left_trailing = (remaining / trailing_rate) if trailing_rate and trailing_rate > 0 else None
+
+    print("--- Cap projection ---")
+    print(f"Remaining budget: {remaining:.2f} CU-hrs (cap: {CAP_CU_HRS:.0f} CU-hrs)")
+    print(f"Runway at overall average ({overall_rate:.2f} CU-hrs/day): ~{days_left_overall:.0f} days")
+    if days_left_trailing is not None:
+        print(f"Runway at last {len(window)}-reading pace ({trailing_rate:.2f} CU-hrs/day): ~{days_left_trailing:.0f} days")
+
+    if cumulative >= WARN_THRESHOLD:
+        print(f"\n⚠️  WARNING: cumulative usage ({cumulative:.2f} CU-hrs) has crossed the "
+              f"{WARN_THRESHOLD:.0f} CU-hr threshold - only {remaining:.2f} CU-hrs left before the cap.")
+    elif days_left_trailing is not None and days_left_trailing < RUNWAY_WARN_DAYS:
+        print(f"\n⚠️  WARNING: at the recent usage pace, you're projected to hit the cap in "
+              f"under {RUNWAY_WARN_DAYS} days (~{days_left_trailing:.0f} days).")
+    print()
 
 
 def print_history(entries):
@@ -90,6 +136,8 @@ def print_history(entries):
             overall_rate = (total_delta / total_hours) * 24
             print(f"Overall since first reading: +{total_delta:.2f} CU-hrs "
                   f"over {total_hours:.1f}h -> ~{overall_rate:.2f} CU-hrs/day average\n")
+
+    print_cap_projection(entries)
 
 
 def main():
