@@ -2,8 +2,8 @@
 """
 Paper Trading System v7.0 - Main Flask Application
 Features:
-- EOD auto-close at 15:30 IST (intraday enforcement)
-- Block new entries after 15:10 IST
+- EOD auto-close at 15:00 IST (intraday enforcement)
+- Block new entries after 14:55 IST
 - Re-enable trading at 09:10 IST
 - Kill switch (manual halt/resume)
 - Emergency close all positions
@@ -214,10 +214,10 @@ def _get_option_price(pos: dict) -> tuple:
 
 # ── EOD Auto-Close ─────────────────────────────────────────────────────────
 
-def close_all_positions_eod(reason: str = "EOD Auto-Close 15:30"):
+def close_all_positions_eod(reason: str = "EOD Auto-Close 15:00"):
     """
     Close all open positions.
-    Used by scheduler at 15:30 and by emergency-close route.
+    Used by scheduler at 15:00 and by emergency-close route.
     Flags estimated prices clearly in exit_reason.
     """
     logger.info(f"Close all triggered: {reason}")
@@ -333,15 +333,15 @@ def close_all_positions_eod(reason: str = "EOD Auto-Close 15:30"):
 
 def _eod_scheduler_job():
     """Scheduled EOD close — skips if kill switch was manually set by user."""
-    close_all_positions_eod("EOD Auto-Close 15:30")
+    close_all_positions_eod("EOD Auto-Close 15:00")
 
 
 def _block_entries_job():
-    """Block new entries at 15:25 — only if trading was enabled (don't overwrite manual halt)."""
+    """Block new entries at 14:55 — only if trading was enabled (don't overwrite manual halt)."""
     if db.is_trading_enabled(TRADING_MODE):
-        db.set_trading_enabled(False, TRADING_MODE, "Market closed 15:25")
-        logger.info("Scheduler: new entries blocked at 15:25")
-        send_message("*Market Closed*\nNew entries blocked (15:25 IST)")
+        db.set_trading_enabled(False, TRADING_MODE, "Market closed 14:55")
+        logger.info("Scheduler: new entries blocked at 14:55")
+        send_message("*Market Closed*\nNew entries blocked (14:55 IST)")
 
 
 def _enable_trading_job():
@@ -404,12 +404,12 @@ def start_scheduler():
         )
         scheduler.add_job(
             _eod_scheduler_job,
-            trigger="cron", hour=15, minute=30,
+            trigger="cron", hour=15, minute=0,
             day_of_week="mon-fri", id="eod_close", replace_existing=True
         )
         scheduler.add_job(
             _block_entries_job,
-            trigger="cron", hour=15, minute=25,
+            trigger="cron", hour=14, minute=55,
             day_of_week="mon-fri", id="block_entries", replace_existing=True
         )
         scheduler.add_job(
@@ -419,7 +419,7 @@ def start_scheduler():
         )
 
         scheduler.start()
-        logger.info("Scheduler started: warm 08:58 | enable 09:10 | block 15:25 | EOD close 15:30 IST")
+        logger.info("Scheduler started: warm 08:58 | enable 09:10 | block 14:55 | EOD close 15:00 IST")
         return scheduler
 
     except Exception as e:
@@ -1028,10 +1028,10 @@ def _handle_open(payload: dict, action: str, symbol: str, webhook_id: int):
         _notify_rejection(action, symbol, "Valid price required")
         return
 
-    # Block new entries at or after 15:10 IST
+    # Block new entries at or after 14:55 IST
     now_ist = datetime.now(IST)
-    if now_ist.hour > 15 or (now_ist.hour == 15 and now_ist.minute >= 10):
-        _notify_rejection(action, symbol, "New entries blocked after 15:10 IST (intraday only)")
+    if now_ist.hour > 14 or (now_ist.hour == 14 and now_ist.minute >= 55):
+        _notify_rejection(action, symbol, "New entries blocked after 14:55 IST (intraday only)")
         return
 
     qty       = int(payload.get("quantity", LOT_SIZE))
@@ -1289,8 +1289,8 @@ def api_market_status():
         "status":           status,
         "current_time_ist": now_ist.strftime("%H:%M:%S"),
         "opens_at":         "09:15",
-        "closes_at":        "15:25",
-        "eod_auto_close":   "15:30",
+        "closes_at":        "14:55",
+        "eod_auto_close":   "15:00",
         "timezone":         "Asia/Kolkata",
         "is_weekday":       weekday < 5,
     })
@@ -1378,7 +1378,7 @@ def api_system_info():
         "uptime_seconds":          int(time.time() - START_TIME),
         "trading_enabled":         db.is_trading_enabled(TRADING_MODE),
         "scheduler":               "active" if scheduler else "inactive",
-        "eod_auto_close":          "15:30 IST weekdays",
+        "eod_auto_close":          "15:00 IST weekdays",
     })
 
 
@@ -1406,8 +1406,8 @@ if __name__ == "__main__":
     logger.info(f"Mode:    {TRADING_MODE}")
     logger.info(f"Capital: Rs.{INITIAL_CAPITAL:,.2f}")
     logger.info(f"Lot:     {LOT_SIZE} units")
-    logger.info("Intraday: entries blocked after 15:10 IST")
-    logger.info("EOD auto-close: 15:30 IST weekdays")
+    logger.info("Intraday: entries blocked after 14:55 IST")
+    logger.info("EOD auto-close: 15:00 IST weekdays")
     logger.info("=" * 60)
     notify_startup(INITIAL_CAPITAL, TRADING_MODE)
     app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
